@@ -253,6 +253,7 @@ export default class MeetingNotesPlugin extends Plugin {
   async loadSettings() {
     const loaded = (await this.loadData()) as Partial<MeetingNotesSettings> | null;
     this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
+    let shouldSave = false;
     if (this.settings.summaryInstructions.trim() === LEGACY_DEFAULT_SUMMARY_INSTRUCTIONS) {
       this.settings.summaryInstructions = "";
     }
@@ -262,7 +263,19 @@ export default class MeetingNotesPlugin extends Plugin {
     if (this.settings.titleDateSource !== "recording" && this.settings.titleDateSource !== "today") {
       this.settings.titleDateSource = DEFAULT_SETTINGS.titleDateSource;
     }
-    this.settings.summaryModel = normalizeSummaryModel(this.settings.summaryModel);
+    const normalizedSummaryModel = normalizeSummaryModel(this.settings.summaryModel);
+    if (this.settings.summaryModel !== normalizedSummaryModel) {
+      this.settings.summaryModel = normalizedSummaryModel;
+      shouldSave = true;
+    }
+    const normalizedAvailableSummaryModels = normalizeSummaryModelOptions(this.settings.availableSummaryModels);
+    if (this.settings.availableSummaryModels.join("\n") !== normalizedAvailableSummaryModels.join("\n")) {
+      this.settings.availableSummaryModels = normalizedAvailableSummaryModels;
+      shouldSave = true;
+    }
+    if (shouldSave) {
+      await this.saveSettings();
+    }
   }
 
   async saveSettings() {
@@ -287,11 +300,14 @@ export default class MeetingNotesPlugin extends Plugin {
       throw new Error(readOpenAiError(response.text, `OpenAI model list request failed with HTTP ${response.status}`));
     }
 
-    const models = readModelIds(response.json).filter(isLikelySummaryModel).sort((left, right) => left.localeCompare(right));
+    const models = normalizeSummaryModelOptions(readModelIds(response.json).filter(isLikelySummaryModel)).sort((left, right) =>
+      left.localeCompare(right)
+    );
     if (models.length === 0) {
       throw new Error("OpenAI returned no text-capable model IDs.");
     }
 
+    this.settings.summaryModel = normalizeSummaryModel(this.settings.summaryModel);
     this.settings.availableSummaryModels = models;
     await this.saveSettings();
     return models.length;
@@ -979,11 +995,12 @@ class MeetingNotesSettingTab extends PluginSettingTab {
       .setName("Summary model")
       .setDesc("Used by Generate meeting notes when summary is enabled, Transcribe and summary, and Summary.")
       .addDropdown((dropdown) => {
+        const selectedSummaryModel = normalizeSummaryModel(this.plugin.settings.summaryModel);
         for (const model of getSummaryModelOptions(this.plugin.settings)) {
           dropdown.addOption(model, model);
         }
-        dropdown.setValue(this.plugin.settings.summaryModel || DEFAULT_SETTINGS.summaryModel).onChange(async (value) => {
-          this.plugin.settings.summaryModel = value;
+        dropdown.setValue(selectedSummaryModel).onChange(async (value) => {
+          this.plugin.settings.summaryModel = normalizeSummaryModel(value);
           await this.plugin.saveSettings();
         });
       })
@@ -1920,20 +1937,23 @@ function readOpenAiError(body: string, fallback: string): string {
 function normalizeSummaryModel(model: string): string {
   const value = model.trim();
   if (value === "gpt-5.5-mini") {
-    return "gpt-5.4-mini";
+    return DEFAULT_SETTINGS.summaryModel;
   }
   return value || DEFAULT_SETTINGS.summaryModel;
 }
 
+function normalizeSummaryModelOptions(models: string[]): string[] {
+  const normalized = models.map(normalizeSummaryModel).filter((model) => model !== "gpt-5.5-mini");
+  return Array.from(new Set(normalized.filter(Boolean)));
+}
+
 function getSummaryModelOptions(settings: MeetingNotesSettings): string[] {
-  const values = [
+  return normalizeSummaryModelOptions([
     normalizeSummaryModel(settings.summaryModel),
     DEFAULT_SETTINGS.summaryModel,
     ...DEFAULT_SUMMARY_MODEL_OPTIONS,
     ...settings.availableSummaryModels,
-  ].map((value) => value.trim());
-
-  return Array.from(new Set(values.filter(Boolean)));
+  ]);
 }
 
 function readModelIds(responseJson: unknown): string[] {
