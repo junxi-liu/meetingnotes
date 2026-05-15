@@ -13,6 +13,7 @@ import {
 
 type JobMode = "generate" | "transcribe" | "transcribe-diarize" | "transcribe-summary" | "transcribe-summary-diarize" | "summary";
 type ProgressStatus = "pending" | "running" | "done" | "error";
+type TitleDateSource = "recording" | "today";
 
 interface MeetingNotesSettings {
   apiKey: string;
@@ -20,14 +21,24 @@ interface MeetingNotesSettings {
   diarize: boolean;
   generateSummary: boolean;
   summaryModel: string;
+  availableSummaryModels: string[];
   includeSectionSummary: boolean;
   includeSectionDiscussedItems: boolean;
   includeSectionDecisions: boolean;
   includeSectionNextSteps: boolean;
   includeSectionTodo: boolean;
+  summarySectionSummaryName: string;
+  summarySectionDiscussedItemsName: string;
+  summarySectionDecisionsName: string;
+  summarySectionNextStepsName: string;
+  summarySectionTodoName: string;
   splitTranscriptForSummary: boolean;
   outputFolder: string;
+  saveWithRecording: boolean;
   noteTitleTemplate: string;
+  titleDateFormat: string;
+  titleDateSource: TitleDateSource;
+  deleteRecordingAfterSuccess: boolean;
   transcriptionPrompt: string;
   summaryInstructions: string;
   showGenerateMeetingNotes: boolean;
@@ -113,14 +124,24 @@ const DEFAULT_SETTINGS: MeetingNotesSettings = {
   diarize: false,
   generateSummary: true,
   summaryModel: "gpt-5.5",
+  availableSummaryModels: [],
   includeSectionSummary: true,
   includeSectionDiscussedItems: true,
   includeSectionDecisions: true,
   includeSectionNextSteps: true,
   includeSectionTodo: true,
+  summarySectionSummaryName: "Summary",
+  summarySectionDiscussedItemsName: "What was discussed",
+  summarySectionDecisionsName: "Decisions made",
+  summarySectionNextStepsName: "Next steps",
+  summarySectionTodoName: "Task to do",
   splitTranscriptForSummary: false,
   outputFolder: "Meeting Notes",
-  noteTitleTemplate: "{{file}} transcript {{date}}",
+  saveWithRecording: false,
+  noteTitleTemplate: "{{date}}",
+  titleDateFormat: "YYYY-MM-DD",
+  titleDateSource: "recording",
+  deleteRecordingAfterSuccess: false,
   transcriptionPrompt: "",
   summaryInstructions: "",
   showGenerateMeetingNotes: true,
@@ -145,8 +166,18 @@ const MAX_DIRECT_UPLOAD_BYTES = 24 * 1024 * 1024;
 const TARGET_CHUNK_UPLOAD_BYTES = 22 * 1024 * 1024;
 const CHUNK_SAMPLE_RATE = 16000;
 const CHUNK_BYTES_PER_SECOND = CHUNK_SAMPLE_RATE * 2;
+const LEGACY_DEFAULT_TITLE_TEMPLATE = "{{file}} transcript {{date}}";
 const LEGACY_DEFAULT_SUMMARY_INSTRUCTIONS =
   "Create concise meeting notes with: overview, decisions, action items, unresolved questions, and important details. Preserve names, dates, numbers, and terminology from the transcript.";
+const DEFAULT_SUMMARY_MODEL_OPTIONS = [
+  "gpt-5.5",
+  "gpt-5.4",
+  "gpt-5.4-mini",
+  "gpt-4.1",
+  "gpt-4.1-mini",
+  "gpt-4o",
+  "gpt-4o-mini",
+];
 
 export default class MeetingNotesPlugin extends Plugin {
   settings: MeetingNotesSettings;
@@ -169,10 +200,44 @@ export default class MeetingNotesPlugin extends Plugin {
     if (this.settings.summaryInstructions.trim() === LEGACY_DEFAULT_SUMMARY_INSTRUCTIONS) {
       this.settings.summaryInstructions = "";
     }
+    if (!loaded?.noteTitleTemplate || loaded.noteTitleTemplate === LEGACY_DEFAULT_TITLE_TEMPLATE) {
+      this.settings.noteTitleTemplate = DEFAULT_SETTINGS.noteTitleTemplate;
+    }
+    if (this.settings.titleDateSource !== "recording" && this.settings.titleDateSource !== "today") {
+      this.settings.titleDateSource = DEFAULT_SETTINGS.titleDateSource;
+    }
   }
 
   async saveSettings() {
     await this.saveData(this.settings);
+  }
+
+  async refreshAvailableSummaryModels(): Promise<number> {
+    if (!this.settings.apiKey.trim()) {
+      throw new Error("Add your OpenAI API key before refreshing models.");
+    }
+
+    const response = await requestUrl({
+      url: "https://api.openai.com/v1/models",
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${this.settings.apiKey.trim()}`,
+      },
+      throw: false,
+    });
+
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(readOpenAiError(response.text, `OpenAI model list request failed with HTTP ${response.status}`));
+    }
+
+    const models = readModelIds(response.json).filter(isLikelySummaryModel).sort((left, right) => left.localeCompare(right));
+    if (models.length === 0) {
+      throw new Error("OpenAI returned no text-capable model IDs.");
+    }
+
+    this.settings.availableSummaryModels = models;
+    await this.saveSettings();
+    return models.length;
   }
 
   private addAudioFileMenuItems(menu: Menu, file: TAbstractFile) {
@@ -277,8 +342,15 @@ export default class MeetingNotesPlugin extends Plugin {
     }
 
     const transcriptionModel = this.effectiveTranscriptionModel(options);
-    const title = renderTemplate(options.titleTemplate, sourceFile, options.mode, transcriptionModel);
-    const outputPath = await this.getAvailableOutputPath(title);
+    const title = renderTemplate(
+      options.titleTemplate,
+      sourceFile,
+      options.mode,
+      transcriptionModel,
+      this.settings.titleDateFormat,
+      this.settings.titleDateSource
+    );
+    const outputPath = await this.getAvailableOutputPath(title, sourceFile);
     const now = new Date().toISOString();
     const state: JobState = {
       title,
@@ -305,6 +377,9 @@ export default class MeetingNotesPlugin extends Plugin {
 
     if (options.includeSummary) {
       state.progress.push({ label: "Summarize transcript", status: "pending" });
+    }
+    if (this.settings.deleteRecordingAfterSuccess) {
+      state.progress.push({ label: "Delete source recording", status: "pending" });
     }
 
     const outputFile = await this.app.vault.create(outputPath, renderJobNote(state));
@@ -353,6 +428,10 @@ export default class MeetingNotesPlugin extends Plugin {
         await this.updateProgress(outputFile, state, "Summarize transcript", "done");
       }
 
+      if (this.settings.deleteRecordingAfterSuccess) {
+        await this.trashSourceRecording(outputFile, state, sourceFile);
+      }
+
       state.status = "completed";
       state.updatedAt = new Date().toISOString();
       await this.writeState(outputFile, state);
@@ -373,8 +452,8 @@ export default class MeetingNotesPlugin extends Plugin {
     return options.diarize ? "gpt-4o-transcribe-diarize" : options.transcriptionModel.trim() || DEFAULT_SETTINGS.transcriptionModel;
   }
 
-  private async getAvailableOutputPath(rawTitle: string): Promise<string> {
-    const folder = normalizePath(this.settings.outputFolder.trim());
+  private async getAvailableOutputPath(rawTitle: string, sourceFile: TFile): Promise<string> {
+    const folder = this.settings.saveWithRecording ? getParentPath(sourceFile.path) : normalizePath(this.settings.outputFolder.trim());
     if (folder) {
       await ensureFolder(this.app, folder);
     }
@@ -390,6 +469,18 @@ export default class MeetingNotesPlugin extends Plugin {
     }
 
     return candidate;
+  }
+
+  private async trashSourceRecording(outputFile: TFile, state: JobState, sourceFile: TFile) {
+    await this.updateProgress(outputFile, state, "Delete source recording", "running", "Moving source file to system trash");
+
+    try {
+      await this.app.vault.trash(sourceFile, true);
+      await this.updateProgress(outputFile, state, "Delete source recording", "done", "Moved to system trash");
+    } catch (error) {
+      await this.updateProgress(outputFile, state, "Delete source recording", "error", getErrorMessage(error));
+      new Notice(`Meeting Notes: note completed, but the recording was not deleted: ${getErrorMessage(error)}`);
+    }
   }
 
   private async prepareChunkPlans(
@@ -540,7 +631,7 @@ export default class MeetingNotesPlugin extends Plugin {
     if (!text) {
       throw new Error("OpenAI summary response did not contain output text.");
     }
-    return normalizeSummaryMarkdown(text);
+    return normalizeSummaryMarkdown(text, this.settings);
   }
 
   private async updateProgress(outputFile: TFile, state: JobState, label: string, status: ProgressStatus, detail?: string) {
@@ -583,11 +674,54 @@ class MeetingNotesSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
+    let defaultPromptPreview: HTMLTextAreaElement | null = null;
+    let currentPromptPreview: HTMLTextAreaElement | null = null;
+    const refreshPromptPreviews = () => {
+      if (defaultPromptPreview) {
+        defaultPromptPreview.value = buildGeneratedSummaryInstructions(DEFAULT_SETTINGS);
+      }
+      if (currentPromptPreview) {
+        currentPromptPreview.value = buildGeneratedSummaryInstructions(this.plugin.settings);
+      }
+    };
+    const saveAndRefreshPromptPreviews = async () => {
+      await this.plugin.saveSettings();
+      refreshPromptPreviews();
+    };
+    const addSummarySectionSetting = (
+      label: string,
+      desc: string,
+      enabled: boolean,
+      onEnabledChange: (value: boolean) => void,
+      name: string,
+      onNameChange: (value: string) => void,
+      placeholder: string
+    ) => {
+      new Setting(containerEl)
+        .setName(label)
+        .setDesc(desc)
+        .addToggle((toggle) => {
+          toggle.setValue(enabled).onChange(async (value) => {
+            onEnabledChange(value);
+            await saveAndRefreshPromptPreviews();
+          });
+        })
+        .addText((text) => {
+          text
+            .setPlaceholder(placeholder)
+            .setValue(name)
+            .onChange(async (value) => {
+              onNameChange(value.trim());
+              await saveAndRefreshPromptPreviews();
+            });
+        });
+    };
+
     containerEl.createEl("h3", { text: "OpenAI" });
 
     new Setting(containerEl)
       .setName("OpenAI API key")
-      .setDesc("Stored in this vault's plugin data.")
+      .setDesc("Stored in this vault's plugin data. Used for transcription, summary, and refreshing available models.")
       .addText((text) => {
         text.inputEl.type = "password";
         text
@@ -600,8 +734,38 @@ class MeetingNotesSettingTab extends PluginSettingTab {
       });
 
     new Setting(containerEl)
+      .setName("Summary model")
+      .setDesc("Used by Generate meeting notes when summary is enabled, Transcribe and summary, and Summary.")
+      .addDropdown((dropdown) => {
+        for (const model of getSummaryModelOptions(this.plugin.settings)) {
+          dropdown.addOption(model, model);
+        }
+        dropdown.setValue(this.plugin.settings.summaryModel || DEFAULT_SETTINGS.summaryModel).onChange(async (value) => {
+          this.plugin.settings.summaryModel = value;
+          await this.plugin.saveSettings();
+        });
+      })
+      .addButton((button) => {
+        button.setButtonText("Refresh models").onClick(async () => {
+          button.setDisabled(true);
+          button.setButtonText("Refreshing...");
+          try {
+            const count = await this.plugin.refreshAvailableSummaryModels();
+            new Notice(`Meeting Notes: refreshed ${count} summary model options.`);
+            this.display();
+          } catch (error) {
+            new Notice(`Meeting Notes: ${getErrorMessage(error)}`);
+            button.setDisabled(false);
+            button.setButtonText("Refresh models");
+          }
+        });
+      });
+
+    containerEl.createEl("h3", { text: "Generate meeting notes defaults" });
+
+    new Setting(containerEl)
       .setName("Transcription model")
-      .setDesc("Used by Generate meeting notes and non-diarized actions.")
+      .setDesc("Used by Generate meeting notes when diarization is off, and by all non-diarized right-click actions.")
       .addDropdown((dropdown) => {
         dropdown
           .addOption("gpt-4o-mini-transcribe", "gpt-4o-mini-transcribe")
@@ -616,7 +780,7 @@ class MeetingNotesSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Diarize speakers")
-      .setDesc("Default for Generate meeting notes and Summary. Explicit diarized actions always diarize.")
+      .setDesc("Default for Generate meeting notes and Summary. Explicit diarized right-click actions always diarize.")
       .addToggle((toggle) => {
         toggle.setValue(this.plugin.settings.diarize).onChange(async (value) => {
           this.plugin.settings.diarize = value;
@@ -634,55 +798,77 @@ class MeetingNotesSettingTab extends PluginSettingTab {
         });
       });
 
-    new Setting(containerEl)
-      .setName("Summary model")
-      .setDesc("Used only for summary generation, separate from the transcription model.")
-      .addText((text) => {
-        text
-          .setPlaceholder("gpt-5.5")
-          .setValue(this.plugin.settings.summaryModel)
-          .onChange(async (value) => {
-            this.plugin.settings.summaryModel = value.trim();
-            await this.plugin.saveSettings();
-          });
-      });
-
     containerEl.createEl("h3", { text: "Summary output" });
 
-    new Setting(containerEl).setName("Include Summary section").addToggle((toggle) => {
-      toggle.setValue(this.plugin.settings.includeSectionSummary).onChange(async (value) => {
+    addSummarySectionSetting(
+      "Include summary section",
+      "Short overview section. The text field controls the Markdown subheader name.",
+      this.plugin.settings.includeSectionSummary,
+      (value) => {
         this.plugin.settings.includeSectionSummary = value;
-        await this.plugin.saveSettings();
-      });
-    });
+      },
+      this.plugin.settings.summarySectionSummaryName,
+      (value) => {
+        this.plugin.settings.summarySectionSummaryName = value;
+      },
+      DEFAULT_SETTINGS.summarySectionSummaryName
+    );
 
-    new Setting(containerEl).setName("Include What was discussed section").addToggle((toggle) => {
-      toggle.setValue(this.plugin.settings.includeSectionDiscussedItems).onChange(async (value) => {
+    addSummarySectionSetting(
+      "Include what was discussed section",
+      "Substantive topics covered in the meeting.",
+      this.plugin.settings.includeSectionDiscussedItems,
+      (value) => {
         this.plugin.settings.includeSectionDiscussedItems = value;
-        await this.plugin.saveSettings();
-      });
-    });
+      },
+      this.plugin.settings.summarySectionDiscussedItemsName,
+      (value) => {
+        this.plugin.settings.summarySectionDiscussedItemsName = value;
+      },
+      DEFAULT_SETTINGS.summarySectionDiscussedItemsName
+    );
 
-    new Setting(containerEl).setName("Include Decisions made section").addToggle((toggle) => {
-      toggle.setValue(this.plugin.settings.includeSectionDecisions).onChange(async (value) => {
+    addSummarySectionSetting(
+      "Include decisions made section",
+      "Settled conclusions only.",
+      this.plugin.settings.includeSectionDecisions,
+      (value) => {
         this.plugin.settings.includeSectionDecisions = value;
-        await this.plugin.saveSettings();
-      });
-    });
+      },
+      this.plugin.settings.summarySectionDecisionsName,
+      (value) => {
+        this.plugin.settings.summarySectionDecisionsName = value;
+      },
+      DEFAULT_SETTINGS.summarySectionDecisionsName
+    );
 
-    new Setting(containerEl).setName("Include Next steps section").addToggle((toggle) => {
-      toggle.setValue(this.plugin.settings.includeSectionNextSteps).onChange(async (value) => {
+    addSummarySectionSetting(
+      "Include next steps section",
+      "Generalized guidance that follows from the meeting.",
+      this.plugin.settings.includeSectionNextSteps,
+      (value) => {
         this.plugin.settings.includeSectionNextSteps = value;
-        await this.plugin.saveSettings();
-      });
-    });
+      },
+      this.plugin.settings.summarySectionNextStepsName,
+      (value) => {
+        this.plugin.settings.summarySectionNextStepsName = value;
+      },
+      DEFAULT_SETTINGS.summarySectionNextStepsName
+    );
 
-    new Setting(containerEl).setName("Include Task to do section").addToggle((toggle) => {
-      toggle.setValue(this.plugin.settings.includeSectionTodo).onChange(async (value) => {
+    addSummarySectionSetting(
+      "Include task to do section",
+      "Specific action items. Items are generated as ordered Markdown checkboxes.",
+      this.plugin.settings.includeSectionTodo,
+      (value) => {
         this.plugin.settings.includeSectionTodo = value;
-        await this.plugin.saveSettings();
-      });
-    });
+      },
+      this.plugin.settings.summarySectionTodoName,
+      (value) => {
+        this.plugin.settings.summarySectionTodoName = value;
+      },
+      DEFAULT_SETTINGS.summarySectionTodoName
+    );
 
     new Setting(containerEl)
       .setName("Split transcript before summary")
@@ -694,15 +880,27 @@ class MeetingNotesSettingTab extends PluginSettingTab {
         });
       });
 
-    containerEl.createEl("h3", { text: "Notes" });
+    containerEl.createEl("h3", { text: "Note creation" });
+
+    new Setting(containerEl)
+      .setName("Save note beside recording")
+      .setDesc("When on, the new note is saved in the same folder as the audio file and the output folder below is ignored.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.saveWithRecording).onChange(async (value) => {
+          this.plugin.settings.saveWithRecording = value;
+          await this.plugin.saveSettings();
+          this.display();
+        });
+      });
 
     new Setting(containerEl)
       .setName("Output folder")
-      .setDesc("Created if it does not exist.")
+      .setDesc("Created if it does not exist. Ignored when Save note beside recording is on.")
       .addText((text) => {
         text
           .setPlaceholder("Meeting Notes")
           .setValue(this.plugin.settings.outputFolder)
+          .setDisabled(this.plugin.settings.saveWithRecording)
           .onChange(async (value) => {
             this.plugin.settings.outputFolder = value.trim();
             await this.plugin.saveSettings();
@@ -711,10 +909,10 @@ class MeetingNotesSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Note title template")
-      .setDesc("Variables: {{file}}, {{stem}}, {{date}}, {{time}}, {{mode}}, {{model}}.")
+      .setDesc("Default is {{date}}. Variables: {{date}}, {{file}}, {{stem}}, {{time}}, {{mode}}, {{model}}. Examples: {{date}}, {{date}} {{stem}}, Meeting {{date}}.")
       .addText((text) => {
         text
-          .setPlaceholder("{{file}} transcript {{date}}")
+          .setPlaceholder("{{date}}")
           .setValue(this.plugin.settings.noteTitleTemplate)
           .onChange(async (value) => {
             this.plugin.settings.noteTitleTemplate = value;
@@ -722,11 +920,48 @@ class MeetingNotesSettingTab extends PluginSettingTab {
           });
       });
 
+    new Setting(containerEl)
+      .setName("Date format")
+      .setDesc("Controls {{date}} in the title template. Supported tokens include YYYY, YY, MM, M, DD, D. Examples: YYYY-MM-DD, YYYYMMDD, YYMMDD.")
+      .addText((text) => {
+        text
+          .setPlaceholder("YYYY-MM-DD")
+          .setValue(this.plugin.settings.titleDateFormat)
+          .onChange(async (value) => {
+            this.plugin.settings.titleDateFormat = value.trim() || DEFAULT_SETTINGS.titleDateFormat;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Date source")
+      .setDesc("Controls whether {{date}} and {{time}} use the recording file creation date or the current date.")
+      .addDropdown((dropdown) => {
+        dropdown
+          .addOption("recording", "Recording date")
+          .addOption("today", "Today's date")
+          .setValue(this.plugin.settings.titleDateSource)
+          .onChange(async (value) => {
+            this.plugin.settings.titleDateSource = value as TitleDateSource;
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Delete recording after successful note")
+      .setDesc("After the note is generated, move the source recording to the system trash. If deletion fails, the note is kept.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.deleteRecordingAfterSuccess).onChange(async (value) => {
+          this.plugin.settings.deleteRecordingAfterSuccess = value;
+          await this.plugin.saveSettings();
+        });
+      });
+
     containerEl.createEl("h3", { text: "Right-click menu" });
 
     new Setting(containerEl)
       .setName("Show Generate meeting notes")
-      .setDesc("Uses the preset transcription model, diarization, summary, and title settings above.")
+      .setDesc("Uses the Generate meeting notes defaults, summary output settings, and note creation settings above.")
       .addToggle((toggle) => {
         toggle.setValue(this.plugin.settings.showGenerateMeetingNotes).onChange(async (value) => {
           this.plugin.settings.showGenerateMeetingNotes = value;
@@ -734,37 +969,49 @@ class MeetingNotesSettingTab extends PluginSettingTab {
         });
       });
 
-    new Setting(containerEl).setName("Show Transcribe").addToggle((toggle) => {
-      toggle.setValue(this.plugin.settings.showTranscribe).onChange(async (value) => {
-        this.plugin.settings.showTranscribe = value;
-        await this.plugin.saveSettings();
+    new Setting(containerEl)
+      .setName("Show Transcribe")
+      .setDesc("Creates a transcript note only. Does not diarize and does not summarize.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.showTranscribe).onChange(async (value) => {
+          this.plugin.settings.showTranscribe = value;
+          await this.plugin.saveSettings();
+        });
       });
-    });
 
-    new Setting(containerEl).setName("Show Transcribe (diarize)").addToggle((toggle) => {
-      toggle.setValue(this.plugin.settings.showTranscribeDiarize).onChange(async (value) => {
-        this.plugin.settings.showTranscribeDiarize = value;
-        await this.plugin.saveSettings();
+    new Setting(containerEl)
+      .setName("Show Transcribe (diarize)")
+      .setDesc("Creates a transcript note only and forces speaker diarization.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.showTranscribeDiarize).onChange(async (value) => {
+          this.plugin.settings.showTranscribeDiarize = value;
+          await this.plugin.saveSettings();
+        });
       });
-    });
 
-    new Setting(containerEl).setName("Show Transcribe and summary").addToggle((toggle) => {
-      toggle.setValue(this.plugin.settings.showTranscribeSummary).onChange(async (value) => {
-        this.plugin.settings.showTranscribeSummary = value;
-        await this.plugin.saveSettings();
+    new Setting(containerEl)
+      .setName("Show Transcribe and summary")
+      .setDesc("Creates a transcript and summary note. Does not diarize.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.showTranscribeSummary).onChange(async (value) => {
+          this.plugin.settings.showTranscribeSummary = value;
+          await this.plugin.saveSettings();
+        });
       });
-    });
 
-    new Setting(containerEl).setName("Show Transcribe and summary (diarize)").addToggle((toggle) => {
-      toggle.setValue(this.plugin.settings.showTranscribeSummaryDiarize).onChange(async (value) => {
-        this.plugin.settings.showTranscribeSummaryDiarize = value;
-        await this.plugin.saveSettings();
+    new Setting(containerEl)
+      .setName("Show Transcribe and summary (diarize)")
+      .setDesc("Creates a transcript and summary note and forces speaker diarization.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.showTranscribeSummaryDiarize).onChange(async (value) => {
+          this.plugin.settings.showTranscribeSummaryDiarize = value;
+          await this.plugin.saveSettings();
+        });
       });
-    });
 
     new Setting(containerEl)
       .setName("Show Summary")
-      .setDesc("Transcribes internally, writes a summary-only note, and uses the default diarization setting.")
+      .setDesc("Creates a summary-only note. It transcribes internally and uses the Generate meeting notes diarization default.")
       .addToggle((toggle) => {
         toggle.setValue(this.plugin.settings.showSummary).onChange(async (value) => {
           this.plugin.settings.showSummary = value;
@@ -798,9 +1045,34 @@ class MeetingNotesSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.summaryInstructions = value;
             await this.plugin.saveSettings();
+            refreshPromptPreviews();
           });
         text.inputEl.rows = 5;
       });
+
+    new Setting(containerEl)
+      .setName("Default generated summary prompt")
+      .setDesc("Plugin defaults, shown for reference.")
+      .addTextArea((text) => {
+        defaultPromptPreview = text.inputEl;
+        text.setValue(buildGeneratedSummaryInstructions(DEFAULT_SETTINGS));
+        text.inputEl.rows = 8;
+        text.inputEl.readOnly = true;
+        text.inputEl.addClass("meeting-notes-prompt-preview");
+      });
+
+    new Setting(containerEl)
+      .setName("Current generated summary prompt")
+      .setDesc("Generated from the current section toggles and section names. Custom Summary instructions above still override it at runtime.")
+      .addTextArea((text) => {
+        currentPromptPreview = text.inputEl;
+        text.setValue(buildGeneratedSummaryInstructions(this.plugin.settings));
+        text.inputEl.rows = 8;
+        text.inputEl.readOnly = true;
+        text.inputEl.addClass("meeting-notes-prompt-preview");
+      });
+
+    refreshPromptPreviews();
   }
 }
 
@@ -919,10 +1191,10 @@ function markRunningItemsFailed(state: JobState) {
   }
 }
 
-function renderTemplate(template: string, file: TFile, mode: JobMode, model: string): string {
-  const now = new Date();
-  const date = now.toISOString().slice(0, 10);
-  const time = now.toTimeString().slice(0, 5).replace(":", "");
+function renderTemplate(template: string, file: TFile, mode: JobMode, model: string, dateFormat: string, dateSource: TitleDateSource): string {
+  const sourceDate = dateSource === "today" ? new Date() : new Date(file.stat.ctime);
+  const date = formatDate(sourceDate, dateFormat || DEFAULT_SETTINGS.titleDateFormat);
+  const time = formatDate(sourceDate, "HHmm");
 
   return (template || DEFAULT_SETTINGS.noteTitleTemplate)
     .split("{{file}}")
@@ -946,6 +1218,31 @@ function sanitizeFileName(value: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 180);
+}
+
+function formatDate(date: Date, format: string): string {
+  const values: Record<string, string> = {
+    YYYY: String(date.getFullYear()),
+    YY: String(date.getFullYear()).slice(-2),
+    MM: pad2(date.getMonth() + 1),
+    M: String(date.getMonth() + 1),
+    DD: pad2(date.getDate()),
+    D: String(date.getDate()),
+    HH: pad2(date.getHours()),
+    H: String(date.getHours()),
+    mm: pad2(date.getMinutes()),
+    m: String(date.getMinutes()),
+    ss: pad2(date.getSeconds()),
+    s: String(date.getSeconds()),
+  };
+
+  return (format || DEFAULT_SETTINGS.titleDateFormat).replace(/YYYY|YY|MM|M|DD|D|HH|H|mm|m|ss|s/gu, (token) => values[token]);
+}
+
+function getParentPath(path: string): string {
+  const parts = path.split("/");
+  parts.pop();
+  return normalizePath(parts.join("/"));
 }
 
 async function ensureFolder(app: App, folder: string) {
@@ -974,47 +1271,88 @@ function buildSummaryInstructions(settings: MeetingNotesSettings): string {
     return customPrompt;
   }
 
-  const sections: string[] = [];
-  if (settings.includeSectionSummary) {
-    sections.push("Summary");
-  }
-  if (settings.includeSectionDiscussedItems) {
-    sections.push("What was discussed");
-  }
-  if (settings.includeSectionDecisions) {
-    sections.push("Decisions made");
-  }
-  if (settings.includeSectionNextSteps) {
-    sections.push("Next steps");
-  }
-  if (settings.includeSectionTodo) {
-    sections.push("Task to do");
-  }
+  return buildGeneratedSummaryInstructions(settings);
+}
 
-  const selectedSections = sections.length > 0 ? sections : ["Summary"];
+function buildGeneratedSummaryInstructions(settings: MeetingNotesSettings): string {
+  const sections = getSummarySections(settings).filter((section) => section.enabled);
+  const selectedSections = sections.length > 0 ? sections : [getSummarySections(DEFAULT_SETTINGS)[0]];
+
   return [
     "Create concise meeting notes from the transcript.",
     "Use only the transcript content; do not invent names, dates, decisions, or tasks.",
     "Preserve important names, dates, numbers, and technical terms.",
-    `Return Markdown with exactly these subheaders, in this order: ${selectedSections.map((section) => `## ${section}`).join(", ")}.`,
+    `Return Markdown with exactly these subheaders, in this order: ${selectedSections.map((section) => `## ${section.name}`).join(", ")}.`,
     "Use ordered lists under each subheader. Do not use simple bullet points.",
-    "For What was discussed, list the substantive topics covered.",
-    "For Decisions made, list decisions or settled conclusions only.",
-    "For Next steps, list generalized guidance that follows from the meeting.",
-    "For Task to do, list specific actionable tasks only. Use ordered Markdown task checkboxes exactly like `1. [ ] Task`; include owner or deadline only if stated.",
+    ...selectedSections.map(summarySectionInstruction),
   ].join("\n");
 }
 
-function normalizeSummaryMarkdown(summary: string): string {
+function getSummarySections(settings: MeetingNotesSettings) {
+  return [
+    {
+      key: "summary",
+      enabled: settings.includeSectionSummary,
+      name: sectionName(settings.summarySectionSummaryName, DEFAULT_SETTINGS.summarySectionSummaryName),
+    },
+    {
+      key: "discussed",
+      enabled: settings.includeSectionDiscussedItems,
+      name: sectionName(settings.summarySectionDiscussedItemsName, DEFAULT_SETTINGS.summarySectionDiscussedItemsName),
+    },
+    {
+      key: "decisions",
+      enabled: settings.includeSectionDecisions,
+      name: sectionName(settings.summarySectionDecisionsName, DEFAULT_SETTINGS.summarySectionDecisionsName),
+    },
+    {
+      key: "nextSteps",
+      enabled: settings.includeSectionNextSteps,
+      name: sectionName(settings.summarySectionNextStepsName, DEFAULT_SETTINGS.summarySectionNextStepsName),
+    },
+    {
+      key: "todo",
+      enabled: settings.includeSectionTodo,
+      name: sectionName(settings.summarySectionTodoName, DEFAULT_SETTINGS.summarySectionTodoName),
+    },
+  ];
+}
+
+function summarySectionInstruction(section: { key: string; name: string }): string {
+  if (section.key === "summary") {
+    return `For ${section.name}, write a short overview.`;
+  }
+  if (section.key === "discussed") {
+    return `For ${section.name}, list the substantive topics covered.`;
+  }
+  if (section.key === "decisions") {
+    return `For ${section.name}, list decisions or settled conclusions only.`;
+  }
+  if (section.key === "nextSteps") {
+    return `For ${section.name}, list generalized guidance that follows from the meeting.`;
+  }
+  return `For ${section.name}, list specific actionable tasks only. Use ordered Markdown task checkboxes exactly like \`1. [ ] Task\`; include owner or deadline only if stated.`;
+}
+
+function sectionName(value: string, fallback: string): string {
+  return value.trim() || fallback;
+}
+
+function matchesHeading(normalizedHeading: string, configuredHeading: string, aliases: string[]): boolean {
+  return normalizedHeading === configuredHeading.toLowerCase() || aliases.includes(normalizedHeading);
+}
+
+function normalizeSummaryMarkdown(summary: string, settings: MeetingNotesSettings): string {
   let inTaskSection = false;
+  const todoName = sectionName(settings.summarySectionTodoName, DEFAULT_SETTINGS.summarySectionTodoName);
 
   return summary
     .split("\n")
     .map((line) => {
       const headingMatch = line.match(/^(#{2,6})\s+(.+?)\s*$/u);
       if (headingMatch) {
-        const heading = normalizeSummaryHeading(headingMatch[2]);
-        inTaskSection = heading === "Task to do";
+        const heading = normalizeSummaryHeading(headingMatch[2], settings);
+        inTaskSection = heading.toLowerCase() === todoName.toLowerCase();
         return `${headingMatch[1]} ${heading}`;
       }
 
@@ -1030,16 +1368,28 @@ function normalizeSummaryMarkdown(summary: string): string {
     .trim();
 }
 
-function normalizeSummaryHeading(heading: string): string {
+function normalizeSummaryHeading(heading: string, settings: MeetingNotesSettings): string {
   const normalized = heading.trim().replace(/:$/u, "").toLowerCase();
-  if (normalized === "discussed items" || normalized === "discussion" || normalized === "what was discussed") {
-    return "What was discussed";
+  const summaryName = sectionName(settings.summarySectionSummaryName, DEFAULT_SETTINGS.summarySectionSummaryName);
+  const discussedName = sectionName(settings.summarySectionDiscussedItemsName, DEFAULT_SETTINGS.summarySectionDiscussedItemsName);
+  const decisionsName = sectionName(settings.summarySectionDecisionsName, DEFAULT_SETTINGS.summarySectionDecisionsName);
+  const nextStepsName = sectionName(settings.summarySectionNextStepsName, DEFAULT_SETTINGS.summarySectionNextStepsName);
+  const todoName = sectionName(settings.summarySectionTodoName, DEFAULT_SETTINGS.summarySectionTodoName);
+
+  if (matchesHeading(normalized, summaryName, ["summary", "overview"])) {
+    return summaryName;
   }
-  if (normalized === "decisions" || normalized === "decisions made") {
-    return "Decisions made";
+  if (matchesHeading(normalized, discussedName, ["discussed items", "discussion", "what was discussed"])) {
+    return discussedName;
   }
-  if (normalized === "todo" || normalized === "to-do" || normalized === "task to do" || normalized === "tasks to do") {
-    return "Task to do";
+  if (matchesHeading(normalized, decisionsName, ["decisions", "decisions made"])) {
+    return decisionsName;
+  }
+  if (matchesHeading(normalized, nextStepsName, ["next steps", "guidance"])) {
+    return nextStepsName;
+  }
+  if (matchesHeading(normalized, todoName, ["todo", "to-do", "task to do", "tasks to do", "action items"])) {
+    return todoName;
   }
   return heading.trim().replace(/:$/u, "");
 }
@@ -1258,6 +1608,49 @@ function readOpenAiError(body: string, fallback: string): string {
     return body || fallback;
   }
   return body || fallback;
+}
+
+function getSummaryModelOptions(settings: MeetingNotesSettings): string[] {
+  const values = [
+    settings.summaryModel,
+    DEFAULT_SETTINGS.summaryModel,
+    ...DEFAULT_SUMMARY_MODEL_OPTIONS,
+    ...settings.availableSummaryModels,
+  ].map((value) => value.trim());
+
+  return Array.from(new Set(values.filter(Boolean)));
+}
+
+function readModelIds(responseJson: unknown): string[] {
+  if (!isRecord(responseJson) || !Array.isArray(responseJson.data)) {
+    return [];
+  }
+
+  return responseJson.data
+    .filter(isRecord)
+    .map((model) => model.id)
+    .filter((id): id is string => typeof id === "string");
+}
+
+function isLikelySummaryModel(modelId: string): boolean {
+  const id = modelId.toLowerCase();
+  const blockedFragments = [
+    "audio",
+    "dall-e",
+    "embedding",
+    "image",
+    "moderation",
+    "realtime",
+    "sora",
+    "speech",
+    "transcribe",
+    "tts",
+    "video",
+    "voice",
+    "whisper",
+  ];
+
+  return !blockedFragments.some((fragment) => id.includes(fragment));
 }
 
 function formatBytes(bytes: number): string {

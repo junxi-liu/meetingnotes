@@ -1,9 +1,6 @@
 # Meeting Notes
 
-Meeting Notes is an Obsidian plugin for existing audio files in your vault. Right-click a supported recording and choose either:
-
-- **Transcribe to note**
-- **Transcribe and summarize to note**
+Meeting Notes is an Obsidian plugin for existing audio files in your vault. Right-click a supported recording and choose a transcription, summary, or preset meeting-notes action.
 
 The plugin creates the Markdown note immediately, then rewrites it with live progress as it prepares the file, calls OpenAI, finishes each chunk, and optionally creates the summary.
 
@@ -11,7 +8,7 @@ The plugin creates the Markdown note immediately, then rewrites it with live pro
 
 The file context menu can show any combination of these actions:
 
-- **Generate meeting notes**: uses your preset model, diarization, summary, and title-template settings.
+- **Generate meeting notes**: uses your preset transcription model, diarization, summary, section, and note-creation settings.
 - **Transcribe**
 - **Transcribe (diarize)**
 - **Transcribe and summary**
@@ -19,6 +16,12 @@ The file context menu can show any combination of these actions:
 - **Summary**: transcribes internally, then writes a summary-only note.
 
 You can hide or show each action in settings.
+
+## Note creation
+
+The default note title is `{{date}}`. The date can come from the recording file creation date or today's date, and the date format is configurable with tokens such as `YYYY-MM-DD` or `YYYYMMDD`.
+
+Notes can be saved to the configured output folder or beside the source recording. If enabled, the source recording is moved to the system trash after the note is generated successfully.
 
 ## Summary workflow
 
@@ -36,6 +39,8 @@ The default summary prompt is generated from section toggles:
 
 Default summaries use Markdown subheaders for each selected section. List-style content is formatted as ordered lists, and **Task to do** items are formatted as ordered Markdown checkboxes such as `1. [ ] Follow up with Alex`. **Next steps** is meant for generalized guidance, while **Task to do** is meant for specific tasks.
 
+Each default summary section can be renamed in settings. The generated prompt preview shows the plugin default prompt and the current prompt built from your toggles and section names.
+
 If you enter custom **Summary instructions**, that prompt overrides the section toggles.
 
 ## Supported audio files
@@ -48,7 +53,7 @@ Settings let you choose:
 
 - Transcription model: `gpt-4o-mini-transcribe`, `gpt-4o-transcribe`, or `whisper-1`.
 - Diarization: when enabled, the plugin uses `gpt-4o-transcribe-diarize` with `response_format=diarized_json` and `chunking_strategy=auto`.
-- Summary model: any Responses API text model, defaulting to `gpt-5.5`.
+- Summary model: any Responses API text model, defaulting to `gpt-5.5`. The summary model dropdown can be refreshed from OpenAI's `GET /v1/models` endpoint using your API key.
 
 ## Privacy and API key
 
