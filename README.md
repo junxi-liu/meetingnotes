@@ -39,9 +39,9 @@ The default summary prompt is generated from section toggles:
 
 Default summaries use Markdown subheaders for each selected section. List-style content is formatted as ordered lists, and **Task to do** items are formatted as ordered Markdown checkboxes such as `1. [ ] Follow up with Alex`. **Next steps** is meant for generalized guidance, while **Task to do** is meant for specific tasks.
 
-Each default summary section can be renamed in settings. The generated prompt preview shows the plugin default prompt and the current prompt built from your toggles and section names.
+Each default summary section can be renamed in settings. The prompt settings show the plugin default prompt and the current prompt built from your toggles and section names.
 
-If you enter custom **Summary instructions**, that prompt overrides the section toggles.
+If you enter a custom **Summary prompt**, that prompt overrides the section toggles.
 
 ## Supported audio files
 

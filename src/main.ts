@@ -674,14 +674,24 @@ class MeetingNotesSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    let defaultPromptPreview: HTMLTextAreaElement | null = null;
-    let currentPromptPreview: HTMLTextAreaElement | null = null;
+    let transcriptionPromptDescEl: HTMLElement | null = null;
+    let summaryPromptDescEl: HTMLElement | null = null;
     const refreshPromptPreviews = () => {
-      if (defaultPromptPreview) {
-        defaultPromptPreview.value = buildGeneratedSummaryInstructions(DEFAULT_SETTINGS);
+      if (transcriptionPromptDescEl) {
+        renderPromptDescription(
+          transcriptionPromptDescEl,
+          "Optional context for non-diarized transcription.",
+          buildGeneratedTranscriptionPromptPreview(DEFAULT_SETTINGS),
+          buildGeneratedTranscriptionPromptPreview(this.plugin.settings)
+        );
       }
-      if (currentPromptPreview) {
-        currentPromptPreview.value = buildGeneratedSummaryInstructions(this.plugin.settings);
+      if (summaryPromptDescEl) {
+        renderPromptDescription(
+          summaryPromptDescEl,
+          "Optional override. Leave blank to use the current generated summary prompt from the selected sections.",
+          buildGeneratedSummaryInstructions(DEFAULT_SETTINGS),
+          buildGeneratedSummaryInstructions(this.plugin.settings)
+        );
       }
     };
     const saveAndRefreshPromptPreviews = async () => {
@@ -801,8 +811,8 @@ class MeetingNotesSettingTab extends PluginSettingTab {
     containerEl.createEl("h3", { text: "Summary output" });
 
     addSummarySectionSetting(
-      "Include summary section",
-      "Short overview section. The text field controls the Markdown subheader name.",
+      "Include Section 1",
+      "Default: Summary. Toggle inclusion; edit the field on the right to change the Markdown header name.",
       this.plugin.settings.includeSectionSummary,
       (value) => {
         this.plugin.settings.includeSectionSummary = value;
@@ -815,8 +825,8 @@ class MeetingNotesSettingTab extends PluginSettingTab {
     );
 
     addSummarySectionSetting(
-      "Include what was discussed section",
-      "Substantive topics covered in the meeting.",
+      "Include Section 2",
+      "Default: What was discussed. Toggle inclusion; edit the field on the right to change the Markdown header name.",
       this.plugin.settings.includeSectionDiscussedItems,
       (value) => {
         this.plugin.settings.includeSectionDiscussedItems = value;
@@ -829,8 +839,8 @@ class MeetingNotesSettingTab extends PluginSettingTab {
     );
 
     addSummarySectionSetting(
-      "Include decisions made section",
-      "Settled conclusions only.",
+      "Include Section 3",
+      "Default: Decisions made. Toggle inclusion; edit the field on the right to change the Markdown header name.",
       this.plugin.settings.includeSectionDecisions,
       (value) => {
         this.plugin.settings.includeSectionDecisions = value;
@@ -843,8 +853,8 @@ class MeetingNotesSettingTab extends PluginSettingTab {
     );
 
     addSummarySectionSetting(
-      "Include next steps section",
-      "Generalized guidance that follows from the meeting.",
+      "Include Section 4",
+      "Default: Next steps. Toggle inclusion; edit the field on the right to change the Markdown header name.",
       this.plugin.settings.includeSectionNextSteps,
       (value) => {
         this.plugin.settings.includeSectionNextSteps = value;
@@ -857,8 +867,8 @@ class MeetingNotesSettingTab extends PluginSettingTab {
     );
 
     addSummarySectionSetting(
-      "Include task to do section",
-      "Specific action items. Items are generated as ordered Markdown checkboxes.",
+      "Include Section 5",
+      "Default: Task to do. Toggle inclusion; edit the field on the right to change the Markdown header name. Items are generated as ordered Markdown checkboxes.",
       this.plugin.settings.includeSectionTodo,
       (value) => {
         this.plugin.settings.includeSectionTodo = value;
@@ -1021,9 +1031,9 @@ class MeetingNotesSettingTab extends PluginSettingTab {
 
     containerEl.createEl("h3", { text: "Prompts" });
 
-    new Setting(containerEl)
+    const transcriptionPromptSetting = new Setting(containerEl)
       .setName("Transcription prompt")
-      .setDesc("Optional context for non-diarized transcription.")
+      .setDesc("")
       .addTextArea((text) => {
         text
           .setPlaceholder("Names, acronyms, terminology, or language preferences")
@@ -1031,13 +1041,15 @@ class MeetingNotesSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.transcriptionPrompt = value;
             await this.plugin.saveSettings();
+            refreshPromptPreviews();
           });
         text.inputEl.rows = 4;
       });
+    transcriptionPromptDescEl = transcriptionPromptSetting.descEl;
 
-    new Setting(containerEl)
-      .setName("Summary instructions")
-      .setDesc("Optional. When filled, this prompt overrides the section choices above.")
+    const summaryPromptSetting = new Setting(containerEl)
+      .setName("Summary prompt")
+      .setDesc("")
       .addTextArea((text) => {
         text
           .setPlaceholder("Leave blank to use the selected section toggles.")
@@ -1049,28 +1061,7 @@ class MeetingNotesSettingTab extends PluginSettingTab {
           });
         text.inputEl.rows = 5;
       });
-
-    new Setting(containerEl)
-      .setName("Default generated summary prompt")
-      .setDesc("Plugin defaults, shown for reference.")
-      .addTextArea((text) => {
-        defaultPromptPreview = text.inputEl;
-        text.setValue(buildGeneratedSummaryInstructions(DEFAULT_SETTINGS));
-        text.inputEl.rows = 8;
-        text.inputEl.readOnly = true;
-        text.inputEl.addClass("meeting-notes-prompt-preview");
-      });
-
-    new Setting(containerEl)
-      .setName("Current generated summary prompt")
-      .setDesc("Generated from the current section toggles and section names. Custom Summary instructions above still override it at runtime.")
-      .addTextArea((text) => {
-        currentPromptPreview = text.inputEl;
-        text.setValue(buildGeneratedSummaryInstructions(this.plugin.settings));
-        text.inputEl.rows = 8;
-        text.inputEl.readOnly = true;
-        text.inputEl.addClass("meeting-notes-prompt-preview");
-      });
+    summaryPromptDescEl = summaryPromptSetting.descEl;
 
     refreshPromptPreviews();
   }
@@ -1263,6 +1254,26 @@ function buildTranscriptionPrompt(basePrompt: string, priorTranscriptTail: strin
     promptParts.push(`Previous transcript context:\n${priorTranscriptTail.trim()}`);
   }
   return promptParts.filter(Boolean).join("\n\n");
+}
+
+function buildGeneratedTranscriptionPromptPreview(settings: MeetingNotesSettings): string {
+  const customPrompt = settings.transcriptionPrompt.trim();
+  const priorContextNote = "Previous transcript context:\n[added automatically from the previous chunk when needed]";
+
+  if (customPrompt) {
+    return `${customPrompt}\n\n${priorContextNote}`;
+  }
+
+  return `No default prompt is sent for the first chunk.\n\n${priorContextNote}`;
+}
+
+function renderPromptDescription(descEl: HTMLElement, intro: string, defaultPrompt: string, currentPrompt: string) {
+  descEl.empty();
+  descEl.createDiv({ text: intro });
+  descEl.createDiv({ text: "Default generated prompt:" }).addClass("meeting-notes-prompt-label");
+  descEl.createEl("pre", { text: defaultPrompt, cls: "meeting-notes-prompt-note" });
+  descEl.createDiv({ text: "Current generated prompt:" }).addClass("meeting-notes-prompt-label");
+  descEl.createEl("pre", { text: currentPrompt, cls: "meeting-notes-prompt-note" });
 }
 
 function buildSummaryInstructions(settings: MeetingNotesSettings): string {

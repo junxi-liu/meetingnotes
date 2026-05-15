@@ -1,7 +1,7 @@
 {
   "id": "meeting-notes",
   "name": "Meeting Notes",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "minAppVersion": "1.6.0",
   "description": "Transcribe existing audio recordings with OpenAI and write progress, transcript, and optional summary to a new note.",
   "author": "Junxi Liu",
