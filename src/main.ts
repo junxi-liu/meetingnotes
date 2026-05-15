@@ -23,6 +23,7 @@ interface MeetingNotesSettings {
   includeSectionSummary: boolean;
   includeSectionDiscussedItems: boolean;
   includeSectionDecisions: boolean;
+  includeSectionNextSteps: boolean;
   includeSectionTodo: boolean;
   splitTranscriptForSummary: boolean;
   outputFolder: string;
@@ -115,6 +116,7 @@ const DEFAULT_SETTINGS: MeetingNotesSettings = {
   includeSectionSummary: true,
   includeSectionDiscussedItems: true,
   includeSectionDecisions: true,
+  includeSectionNextSteps: true,
   includeSectionTodo: true,
   splitTranscriptForSummary: false,
   outputFolder: "Meeting Notes",
@@ -538,7 +540,7 @@ export default class MeetingNotesPlugin extends Plugin {
     if (!text) {
       throw new Error("OpenAI summary response did not contain output text.");
     }
-    return text;
+    return normalizeSummaryMarkdown(text);
   }
 
   private async updateProgress(outputFile: TFile, state: JobState, label: string, status: ProgressStatus, detail?: string) {
@@ -654,21 +656,28 @@ class MeetingNotesSettingTab extends PluginSettingTab {
       });
     });
 
-    new Setting(containerEl).setName("Include Discussed items section").addToggle((toggle) => {
+    new Setting(containerEl).setName("Include What was discussed section").addToggle((toggle) => {
       toggle.setValue(this.plugin.settings.includeSectionDiscussedItems).onChange(async (value) => {
         this.plugin.settings.includeSectionDiscussedItems = value;
         await this.plugin.saveSettings();
       });
     });
 
-    new Setting(containerEl).setName("Include Decisions section").addToggle((toggle) => {
+    new Setting(containerEl).setName("Include Decisions made section").addToggle((toggle) => {
       toggle.setValue(this.plugin.settings.includeSectionDecisions).onChange(async (value) => {
         this.plugin.settings.includeSectionDecisions = value;
         await this.plugin.saveSettings();
       });
     });
 
-    new Setting(containerEl).setName("Include To-do section").addToggle((toggle) => {
+    new Setting(containerEl).setName("Include Next steps section").addToggle((toggle) => {
+      toggle.setValue(this.plugin.settings.includeSectionNextSteps).onChange(async (value) => {
+        this.plugin.settings.includeSectionNextSteps = value;
+        await this.plugin.saveSettings();
+      });
+    });
+
+    new Setting(containerEl).setName("Include Task to do section").addToggle((toggle) => {
       toggle.setValue(this.plugin.settings.includeSectionTodo).onChange(async (value) => {
         this.plugin.settings.includeSectionTodo = value;
         await this.plugin.saveSettings();
@@ -970,13 +979,16 @@ function buildSummaryInstructions(settings: MeetingNotesSettings): string {
     sections.push("Summary");
   }
   if (settings.includeSectionDiscussedItems) {
-    sections.push("Discussed items");
+    sections.push("What was discussed");
   }
   if (settings.includeSectionDecisions) {
-    sections.push("Decisions");
+    sections.push("Decisions made");
+  }
+  if (settings.includeSectionNextSteps) {
+    sections.push("Next steps");
   }
   if (settings.includeSectionTodo) {
-    sections.push("To-do");
+    sections.push("Task to do");
   }
 
   const selectedSections = sections.length > 0 ? sections : ["Summary"];
@@ -984,11 +996,80 @@ function buildSummaryInstructions(settings: MeetingNotesSettings): string {
     "Create concise meeting notes from the transcript.",
     "Use only the transcript content; do not invent names, dates, decisions, or tasks.",
     "Preserve important names, dates, numbers, and technical terms.",
-    `Return Markdown with exactly these sections, in this order: ${selectedSections.join(", ")}.`,
-    "For Discussed items, list the substantive topics covered.",
-    "For Decisions, list decisions or settled conclusions only.",
-    "For To-do, list concrete action items; include owner or deadline only if stated.",
+    `Return Markdown with exactly these subheaders, in this order: ${selectedSections.map((section) => `## ${section}`).join(", ")}.`,
+    "Use ordered lists under each subheader. Do not use simple bullet points.",
+    "For What was discussed, list the substantive topics covered.",
+    "For Decisions made, list decisions or settled conclusions only.",
+    "For Next steps, list generalized guidance that follows from the meeting.",
+    "For Task to do, list specific actionable tasks only. Use ordered Markdown task checkboxes exactly like `1. [ ] Task`; include owner or deadline only if stated.",
   ].join("\n");
+}
+
+function normalizeSummaryMarkdown(summary: string): string {
+  let inTaskSection = false;
+
+  return summary
+    .split("\n")
+    .map((line) => {
+      const headingMatch = line.match(/^(#{2,6})\s+(.+?)\s*$/u);
+      if (headingMatch) {
+        const heading = normalizeSummaryHeading(headingMatch[2]);
+        inTaskSection = heading === "Task to do";
+        return `${headingMatch[1]} ${heading}`;
+      }
+
+      if (inTaskSection) {
+        const taskText = extractListItemText(line);
+        return taskText ? `1. [ ] ${taskText}` : line;
+      }
+
+      const listText = extractBulletItemText(line);
+      return listText ? `1. ${listText}` : line;
+    })
+    .join("\n")
+    .trim();
+}
+
+function normalizeSummaryHeading(heading: string): string {
+  const normalized = heading.trim().replace(/:$/u, "").toLowerCase();
+  if (normalized === "discussed items" || normalized === "discussion" || normalized === "what was discussed") {
+    return "What was discussed";
+  }
+  if (normalized === "decisions" || normalized === "decisions made") {
+    return "Decisions made";
+  }
+  if (normalized === "todo" || normalized === "to-do" || normalized === "task to do" || normalized === "tasks to do") {
+    return "Task to do";
+  }
+  return heading.trim().replace(/:$/u, "");
+}
+
+function extractListItemText(line: string): string | null {
+  const orderedTaskMatch = line.match(/^\s*\d+[\.)]\s+\[[ xX]\]\s+(.+?)\s*$/u);
+  if (orderedTaskMatch) {
+    return orderedTaskMatch[1];
+  }
+
+  const unorderedTaskMatch = line.match(/^\s*[-*+]\s+\[[ xX]\]\s+(.+?)\s*$/u);
+  if (unorderedTaskMatch) {
+    return unorderedTaskMatch[1];
+  }
+
+  const orderedMatch = line.match(/^\s*\d+[\.)]\s+(.+?)\s*$/u);
+  if (orderedMatch) {
+    return orderedMatch[1];
+  }
+
+  return extractBulletItemText(line);
+}
+
+function extractBulletItemText(line: string): string | null {
+  const bulletMatch = line.match(/^\s*[-*+]\s+(.+?)\s*$/u);
+  if (bulletMatch) {
+    return bulletMatch[1];
+  }
+
+  return null;
 }
 
 async function decodeAudio(data: ArrayBuffer): Promise<AudioBuffer> {
