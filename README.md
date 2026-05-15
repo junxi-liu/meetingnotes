@@ -59,7 +59,7 @@ Settings let you choose:
 - Diarization: when enabled, the plugin uses `gpt-4o-transcribe-diarize` with `response_format=diarized_json` and `chunking_strategy=auto`.
 - Summary model: any Responses API text model, defaulting to `gpt-5.5`. The summary model dropdown can be refreshed from OpenAI's `GET /v1/models` endpoint using your API key.
 
-The plugin estimates transcription time from decoded audio duration using rough model-specific heuristics. Actual time depends on audio length, file format, chunk count, diarization, server load, and audio quality.
+Generated notes include transcription and summary usage in the final Properties section. Cost is estimated from usage returned by OpenAI and the plugin's built-in price table for known models; unknown model pricing is shown as unavailable.
 
 ## Privacy and API key
 

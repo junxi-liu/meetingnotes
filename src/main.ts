@@ -62,6 +62,27 @@ interface TranscriptChunk {
   text: string;
 }
 
+interface UsageTotals {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  audioInputTokens: number;
+  textInputTokens: number;
+  cachedInputTokens: number;
+  reasoningTokens: number;
+  durationSeconds: number;
+  costUsd?: number;
+  costUnavailable: boolean;
+}
+
+interface TokenPrices {
+  input: number;
+  cachedInput?: number;
+  output: number;
+}
+
+type UsageKind = "transcription" | "summary";
+
 interface JobState {
   title: string;
   sourcePath: string;
@@ -76,11 +97,10 @@ interface JobState {
   includeTranscript: boolean;
   chunksTotal: number;
   chunksDone: number;
-  sourceDurationSeconds?: number;
-  estimatedTranscriptionSecondsMin?: number;
-  estimatedTranscriptionSecondsMax?: number;
   progress: ProgressItem[];
   transcriptChunks: TranscriptChunk[];
+  transcriptionUsage: UsageTotals;
+  summaryUsage: UsageTotals;
   summary?: string;
   error?: string;
 }
@@ -109,6 +129,12 @@ interface DiarizedSegment {
 interface TranscriptionResult {
   markdown: string;
   text: string;
+  usage: UsageTotals;
+}
+
+interface SummaryResult {
+  text: string;
+  usage: UsageTotals;
 }
 
 interface JobOptions {
@@ -183,6 +209,22 @@ const DEFAULT_SUMMARY_MODEL_OPTIONS = [
   "gpt-4o",
   "gpt-4o-mini",
 ];
+const TEXT_MODEL_PRICES_PER_1M: Record<string, TokenPrices> = {
+  "gpt-5.5": { input: 5, cachedInput: 0.5, output: 30 },
+  "gpt-5.4": { input: 2.5, cachedInput: 0.25, output: 15 },
+  "gpt-5.4-mini": { input: 0.75, cachedInput: 0.075, output: 4.5 },
+  "gpt-5-mini": { input: 0.25, cachedInput: 0.025, output: 2 },
+  "gpt-4.1": { input: 2, cachedInput: 0.5, output: 8 },
+  "gpt-4.1-mini": { input: 0.4, cachedInput: 0.1, output: 1.6 },
+  "gpt-4o": { input: 2.5, cachedInput: 1.25, output: 10 },
+  "gpt-4o-mini": { input: 0.15, cachedInput: 0.075, output: 0.6 },
+};
+const TRANSCRIPTION_TOKEN_PRICES_PER_1M: Record<string, TokenPrices> = {
+  "gpt-4o-transcribe-diarize": { input: 2.5, output: 10 },
+  "gpt-4o-transcribe": { input: 2.5, output: 10 },
+  "gpt-4o-mini-transcribe": { input: 1.25, output: 5 },
+};
+const TRANSCRIPTION_DURATION_PRICE_PER_MINUTE = 0.006;
 
 export default class MeetingNotesPlugin extends Plugin {
   settings: MeetingNotesSettings;
@@ -365,7 +407,7 @@ export default class MeetingNotesPlugin extends Plugin {
       startedAt: now,
       updatedAt: now,
       transcriptionModel,
-      summaryModel: this.settings.summaryModel.trim(),
+      summaryModel: this.settings.summaryModel.trim() || DEFAULT_SETTINGS.summaryModel,
       diarize: options.diarize,
       includeSummary: options.includeSummary,
       includeTranscript: options.includeTranscript,
@@ -375,10 +417,11 @@ export default class MeetingNotesPlugin extends Plugin {
         { label: "Created note", status: "done", detail: outputPath },
         { label: "Read source recording", status: "pending" },
         { label: "Prepare audio", status: "pending" },
-        { label: "Estimate time", status: "pending" },
         { label: "Transcribe audio", status: "pending" },
       ],
       transcriptChunks: [],
+      transcriptionUsage: createUsageTotals(),
+      summaryUsage: createUsageTotals(),
     };
 
     if (options.includeSummary) {
@@ -405,7 +448,6 @@ export default class MeetingNotesPlugin extends Plugin {
         () => this.prepareChunkPlans(sourceFile, sourceData, outputFile, state)
       );
       await this.updateProgress(outputFile, state, "Prepare audio", "done", `${chunkPlans.length} upload${chunkPlans.length === 1 ? "" : "s"}`);
-      await this.updateProgress(outputFile, state, "Estimate time", "done", buildEstimateDetail(state));
 
       await this.updateProgress(outputFile, state, "Transcribe audio", "running", "Connecting to OpenAI");
       let priorTranscriptTail = "";
@@ -426,9 +468,10 @@ export default class MeetingNotesPlugin extends Plugin {
           outputFile,
           state,
           "Transcribe audio",
-          (elapsedSeconds) => buildTranscriptionHeartbeatDetail(state, plan.index, chunkPlans.length, elapsedSeconds),
+          (elapsedSeconds) => buildTranscriptionHeartbeatDetail(plan.index, chunkPlans.length, elapsedSeconds),
           () => this.transcribeChunk(payload, priorTranscriptTail, state)
         );
+        addUsageTotals(state.transcriptionUsage, result.usage);
         state.transcriptChunks.push({
           label: chunkPlans.length === 1 ? "Transcript" : `Chunk ${plan.index}`,
           markdown: result.markdown,
@@ -515,7 +558,6 @@ export default class MeetingNotesPlugin extends Plugin {
     state: JobState
   ): Promise<AudioChunkPlan[]> {
     if (sourceData.byteLength <= MAX_DIRECT_UPLOAD_BYTES) {
-      await this.estimateDirectUploadDuration(sourceData, state);
       state.chunksTotal = 1;
       state.chunksDone = 0;
       await this.writeState(outputFile, state);
@@ -531,7 +573,6 @@ export default class MeetingNotesPlugin extends Plugin {
     );
 
     const audioBuffer = await decodeAudio(sourceData);
-    applyDurationEstimate(state, audioBuffer.duration);
     const chunkSeconds = Math.max(60, Math.floor(TARGET_CHUNK_UPLOAD_BYTES / CHUNK_BYTES_PER_SECOND));
     const total = Math.ceil(audioBuffer.duration / chunkSeconds);
     const plans: AudioChunkPlan[] = [];
@@ -547,17 +588,6 @@ export default class MeetingNotesPlugin extends Plugin {
     state.chunksDone = 0;
     await this.writeState(outputFile, state);
     return plans;
-  }
-
-  private async estimateDirectUploadDuration(sourceData: ArrayBuffer, state: JobState) {
-    try {
-      const audioBuffer = await decodeAudio(sourceData);
-      applyDurationEstimate(state, audioBuffer.duration);
-    } catch {
-      state.sourceDurationSeconds = undefined;
-      state.estimatedTranscriptionSecondsMin = undefined;
-      state.estimatedTranscriptionSecondsMax = undefined;
-    }
   }
 
   private async makeWavChunkPayload(sourceFile: TFile, sourceData: ArrayBuffer, plan: AudioChunkPlan): Promise<AudioChunkPayload> {
@@ -610,19 +640,27 @@ export default class MeetingNotesPlugin extends Plugin {
       throw new Error(readOpenAiError(response.text, `OpenAI transcription request failed with HTTP ${response.status}`));
     }
 
-    return formatTranscriptionResponse(response.json, state.diarize, payload.offsetSeconds);
+    const result = formatTranscriptionResponse(response.json, state.diarize, payload.offsetSeconds);
+    return {
+      ...result,
+      usage: readUsageTotals(response.json, state.transcriptionModel, "transcription"),
+    };
   }
 
   private async summarizeTranscript(outputFile: TFile, state: JobState): Promise<string> {
     const transcript = state.transcriptChunks.map((chunk) => `### ${chunk.label}\n${chunk.text}`).join("\n\n");
 
     if (!this.settings.splitTranscriptForSummary) {
-      return await this.requestSummary(transcript, state.sourcePath, state.summaryModel);
+      const result = await this.requestSummary(transcript, state.sourcePath, state.summaryModel);
+      addUsageTotals(state.summaryUsage, result.usage);
+      return result.text;
     }
 
     const textChunks = splitTextForSummary(transcript);
     if (textChunks.length === 1) {
-      return await this.requestSummary(textChunks[0], state.sourcePath, state.summaryModel);
+      const result = await this.requestSummary(textChunks[0], state.sourcePath, state.summaryModel);
+      addUsageTotals(state.summaryUsage, result.usage);
+      return result.text;
     }
 
     const partialSummaries: string[] = [];
@@ -634,15 +672,20 @@ export default class MeetingNotesPlugin extends Plugin {
         "running",
         `Summarizing transcript part ${index + 1}/${textChunks.length}`
       );
-      partialSummaries.push(await this.requestSummary(textChunks[index], `${state.sourcePath}, part ${index + 1}`, state.summaryModel));
+      const result = await this.requestSummary(textChunks[index], `${state.sourcePath}, part ${index + 1}`, state.summaryModel);
+      addUsageTotals(state.summaryUsage, result.usage);
+      partialSummaries.push(result.text);
     }
 
     await this.updateProgress(outputFile, state, "Summarize transcript", "running", "Combining partial summaries");
-    return await this.requestSummary(partialSummaries.join("\n\n"), `${state.sourcePath}, combined partial summaries`, state.summaryModel);
+    const result = await this.requestSummary(partialSummaries.join("\n\n"), `${state.sourcePath}, combined partial summaries`, state.summaryModel);
+    addUsageTotals(state.summaryUsage, result.usage);
+    return result.text;
   }
 
-  private async requestSummary(transcript: string, sourceLabel: string, summaryModel: string): Promise<string> {
+  private async requestSummary(transcript: string, sourceLabel: string, summaryModel: string): Promise<SummaryResult> {
     const instructions = buildSummaryInstructions(this.settings);
+    const model = summaryModel.trim() || DEFAULT_SETTINGS.summaryModel;
     const response = await requestUrl({
       url: "https://api.openai.com/v1/responses",
       method: "POST",
@@ -651,7 +694,7 @@ export default class MeetingNotesPlugin extends Plugin {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: summaryModel.trim() || DEFAULT_SETTINGS.summaryModel,
+        model,
         instructions,
         input: `Source recording: ${sourceLabel}\n\nTranscript:\n${transcript}`,
         text: {
@@ -669,7 +712,10 @@ export default class MeetingNotesPlugin extends Plugin {
     if (!text) {
       throw new Error("OpenAI summary response did not contain output text.");
     }
-    return normalizeSummaryMarkdown(text, this.settings);
+    return {
+      text: normalizeSummaryMarkdown(text, this.settings),
+      usage: readUsageTotals(response.json, model, "summary"),
+    };
   }
 
   private async updateProgress(outputFile: TFile, state: JobState, label: string, status: ProgressStatus, detail?: string) {
@@ -1245,12 +1291,8 @@ function renderJobNote(state: JobState): string {
     `- started_at: ${state.startedAt}`,
     `- updated_at: ${state.updatedAt}`
   );
-  if (state.sourceDurationSeconds) {
-    lines.push(`- audio_duration: ${formatDuration(state.sourceDurationSeconds)}`);
-  }
-  if (state.estimatedTranscriptionSecondsMin && state.estimatedTranscriptionSecondsMax) {
-    lines.push(`- estimated_transcription_time: ${formatDurationRange(state.estimatedTranscriptionSecondsMin, state.estimatedTranscriptionSecondsMax)}`);
-  }
+  lines.push(...formatUsageProperties("transcription", state.transcriptionUsage));
+  lines.push(...formatUsageProperties("summary", state.summaryUsage));
 
   return `${lines.join("\n").replace(/\s+$/u, "")}\n`;
 }
@@ -1596,7 +1638,7 @@ function writeAscii(view: DataView, offset: number, value: string) {
   }
 }
 
-function formatTranscriptionResponse(responseJson: unknown, diarize: boolean, offsetSeconds: number): TranscriptionResult {
+function formatTranscriptionResponse(responseJson: unknown, diarize: boolean, offsetSeconds: number): Omit<TranscriptionResult, "usage"> {
   if (!diarize) {
     const text = readTextField(responseJson);
     return {
@@ -1766,56 +1808,197 @@ function normalizeProgressUpdateInterval(value: number): number {
   return Math.max(0, Math.min(300, Math.round(value)));
 }
 
-function applyDurationEstimate(state: JobState, durationSeconds: number) {
-  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
-    return;
-  }
-
-  const estimate = estimateTranscriptionSeconds(durationSeconds, state.transcriptionModel);
-  state.sourceDurationSeconds = durationSeconds;
-  state.estimatedTranscriptionSecondsMin = estimate.min;
-  state.estimatedTranscriptionSecondsMax = estimate.max;
-}
-
-function estimateTranscriptionSeconds(durationSeconds: number, model: string): { min: number; max: number } {
-  const modelName = model.toLowerCase();
-  let minRatio = 0.12;
-  let maxRatio = 0.4;
-
-  if (modelName.includes("diarize")) {
-    minRatio = 0.25;
-    maxRatio = 0.75;
-  } else if (modelName.includes("mini")) {
-    minRatio = 0.08;
-    maxRatio = 0.3;
-  } else if (modelName.includes("whisper")) {
-    minRatio = 0.2;
-    maxRatio = 0.65;
-  }
-
+function createUsageTotals(): UsageTotals {
   return {
-    min: Math.max(10, Math.round(durationSeconds * minRatio)),
-    max: Math.max(20, Math.round(durationSeconds * maxRatio)),
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    audioInputTokens: 0,
+    textInputTokens: 0,
+    cachedInputTokens: 0,
+    reasoningTokens: 0,
+    durationSeconds: 0,
+    costUnavailable: false,
   };
 }
 
-function buildEstimateDetail(state: JobState): string {
-  if (!state.sourceDurationSeconds || !state.estimatedTranscriptionSecondsMin || !state.estimatedTranscriptionSecondsMax) {
-    return "Could not estimate audio duration";
+function addUsageTotals(target: UsageTotals, usage: UsageTotals) {
+  if (!hasReportedUsage(usage)) {
+    return;
   }
 
-  return `audio ${formatDuration(state.sourceDurationSeconds)}; transcription roughly ${formatDurationRange(
-    state.estimatedTranscriptionSecondsMin,
-    state.estimatedTranscriptionSecondsMax
-  )}`;
+  target.inputTokens += usage.inputTokens;
+  target.outputTokens += usage.outputTokens;
+  target.totalTokens += usage.totalTokens;
+  target.audioInputTokens += usage.audioInputTokens;
+  target.textInputTokens += usage.textInputTokens;
+  target.cachedInputTokens += usage.cachedInputTokens;
+  target.reasoningTokens += usage.reasoningTokens;
+  target.durationSeconds += usage.durationSeconds;
+  target.costUnavailable = target.costUnavailable || usage.costUnavailable;
+
+  if (typeof usage.costUsd === "number") {
+    target.costUsd = (target.costUsd ?? 0) + usage.costUsd;
+  }
 }
 
-function buildTranscriptionHeartbeatDetail(state: JobState, chunkIndex: number, chunksTotal: number, elapsedSeconds: number): string {
-  const parts = [`chunk ${chunkIndex}/${chunksTotal}`, `elapsed ${formatDuration(elapsedSeconds)}`];
-  if (state.estimatedTranscriptionSecondsMin && state.estimatedTranscriptionSecondsMax) {
-    parts.push(`rough total estimate ${formatDurationRange(state.estimatedTranscriptionSecondsMin, state.estimatedTranscriptionSecondsMax)}`);
+function readUsageTotals(responseJson: unknown, model: string, kind: UsageKind): UsageTotals {
+  const totals = createUsageTotals();
+  if (!isRecord(responseJson) || !isRecord(responseJson.usage)) {
+    return totals;
   }
-  return parts.join("; ");
+
+  const usage = responseJson.usage;
+  const inputDetails = readNestedRecord(usage, "input_token_details") ?? readNestedRecord(usage, "input_tokens_details");
+  const outputDetails = readNestedRecord(usage, "output_token_details") ?? readNestedRecord(usage, "output_tokens_details");
+
+  totals.inputTokens = readNumberField(usage, "input_tokens") || readNumberField(usage, "prompt_tokens");
+  totals.outputTokens = readNumberField(usage, "output_tokens") || readNumberField(usage, "completion_tokens");
+  totals.totalTokens = readNumberField(usage, "total_tokens");
+  totals.durationSeconds = readNumberField(usage, "seconds");
+
+  if (inputDetails) {
+    totals.audioInputTokens = readNumberField(inputDetails, "audio_tokens");
+    totals.textInputTokens = readNumberField(inputDetails, "text_tokens");
+    totals.cachedInputTokens = readNumberField(inputDetails, "cached_tokens");
+  }
+  if (outputDetails) {
+    totals.reasoningTokens = readNumberField(outputDetails, "reasoning_tokens");
+  }
+
+  if (totals.totalTokens === 0 && totals.inputTokens + totals.outputTokens > 0) {
+    totals.totalTokens = totals.inputTokens + totals.outputTokens;
+  }
+
+  const costUsd = calculateUsageCost(totals, model, kind);
+  if (typeof costUsd === "number") {
+    totals.costUsd = costUsd;
+  } else {
+    totals.costUnavailable = hasReportedUsage(totals);
+  }
+
+  return totals;
+}
+
+function calculateUsageCost(usage: UsageTotals, model: string, kind: UsageKind): number | undefined {
+  if (!hasReportedUsage(usage)) {
+    return undefined;
+  }
+
+  if (kind === "transcription" && usage.durationSeconds > 0 && usage.totalTokens === 0) {
+    return (usage.durationSeconds / 60) * TRANSCRIPTION_DURATION_PRICE_PER_MINUTE;
+  }
+
+  const prices =
+    kind === "transcription"
+      ? getModelPricing(TRANSCRIPTION_TOKEN_PRICES_PER_1M, model)
+      : getModelPricing(TEXT_MODEL_PRICES_PER_1M, model);
+  if (!prices || usage.inputTokens + usage.outputTokens === 0) {
+    return undefined;
+  }
+
+  const cachedInputTokens = Math.min(usage.cachedInputTokens, usage.inputTokens);
+  const uncachedInputTokens = Math.max(0, usage.inputTokens - cachedInputTokens);
+  const cachedInputPrice = prices.cachedInput ?? prices.input;
+
+  return (uncachedInputTokens * prices.input + cachedInputTokens * cachedInputPrice + usage.outputTokens * prices.output) / 1_000_000;
+}
+
+function getModelPricing(prices: Record<string, TokenPrices>, model: string): TokenPrices | undefined {
+  const modelId = model.trim().toLowerCase();
+  const keys = Object.keys(prices).sort((a, b) => b.length - a.length);
+
+  for (const key of keys) {
+    const normalizedKey = key.toLowerCase();
+    if (modelId === normalizedKey || modelId.startsWith(`${normalizedKey}-`)) {
+      return prices[key];
+    }
+  }
+
+  return undefined;
+}
+
+function formatUsageProperties(prefix: "transcription" | "summary", usage: UsageTotals): string[] {
+  return [`- ${prefix}_tokens: ${formatUsageSummary(usage)}`, `- ${prefix}_cost_usd: ${formatUsageCost(usage)}`];
+}
+
+function formatUsageSummary(usage: UsageTotals): string {
+  if (!hasReportedUsage(usage)) {
+    return "not reported yet";
+  }
+
+  const parts: string[] = [];
+  if (usage.inputTokens > 0 || usage.outputTokens > 0 || usage.totalTokens > 0) {
+    parts.push(`input ${formatInteger(usage.inputTokens)}`);
+    parts.push(`output ${formatInteger(usage.outputTokens)}`);
+    parts.push(`total ${formatInteger(usage.totalTokens)}`);
+  }
+  if (usage.audioInputTokens > 0) {
+    parts.push(`audio input ${formatInteger(usage.audioInputTokens)}`);
+  }
+  if (usage.textInputTokens > 0) {
+    parts.push(`text input ${formatInteger(usage.textInputTokens)}`);
+  }
+  if (usage.cachedInputTokens > 0) {
+    parts.push(`cached input ${formatInteger(usage.cachedInputTokens)}`);
+  }
+  if (usage.reasoningTokens > 0) {
+    parts.push(`reasoning ${formatInteger(usage.reasoningTokens)}`);
+  }
+  if (usage.durationSeconds > 0) {
+    parts.push(`duration ${formatDuration(usage.durationSeconds)}`);
+  }
+
+  return parts.join("; ") || "reported without billable units";
+}
+
+function formatUsageCost(usage: UsageTotals): string {
+  if (typeof usage.costUsd === "number") {
+    return formatUsd(usage.costUsd);
+  }
+  if (hasReportedUsage(usage) && usage.costUnavailable) {
+    return "unavailable for this model";
+  }
+  return "not reported yet";
+}
+
+function hasReportedUsage(usage: UsageTotals): boolean {
+  return (
+    usage.inputTokens > 0 ||
+    usage.outputTokens > 0 ||
+    usage.totalTokens > 0 ||
+    usage.audioInputTokens > 0 ||
+    usage.textInputTokens > 0 ||
+    usage.cachedInputTokens > 0 ||
+    usage.reasoningTokens > 0 ||
+    usage.durationSeconds > 0 ||
+    usage.costUnavailable
+  );
+}
+
+function readNestedRecord(record: Record<string, unknown>, key: string): Record<string, unknown> | undefined {
+  const value = record[key];
+  return isRecord(value) ? value : undefined;
+}
+
+function readNumberField(record: Record<string, unknown>, key: string): number {
+  const value = record[key];
+  return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function formatInteger(value: number): string {
+  return String(Math.round(value)).replace(/\B(?=(\d{3})+(?!\d))/gu, ",");
+}
+
+function formatUsd(value: number): string {
+  if (value > 0 && value < 0.000001) {
+    return "<$0.000001";
+  }
+  return `$${value.toFixed(6)}`;
+}
+
+function buildTranscriptionHeartbeatDetail(chunkIndex: number, chunksTotal: number, elapsedSeconds: number): string {
+  return `chunk ${chunkIndex}/${chunksTotal}; elapsed ${formatDuration(elapsedSeconds)}`;
 }
 
 function formatBytes(bytes: number): string {
@@ -1823,13 +2006,6 @@ function formatBytes(bytes: number): string {
     return `${Math.round(bytes / 1024)} KB`;
   }
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function formatDurationRange(minSeconds: number, maxSeconds: number): string {
-  if (Math.abs(maxSeconds - minSeconds) < 5) {
-    return formatDuration(maxSeconds);
-  }
-  return `${formatDuration(minSeconds)}-${formatDuration(maxSeconds)}`;
 }
 
 function formatDuration(seconds: number): string {
