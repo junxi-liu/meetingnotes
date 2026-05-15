@@ -16,13 +16,13 @@ The file context menu can show any combination of these actions:
 - **Transcribe and summary**
 - **Transcribe and summary (diarize)**
 - **Summary**: transcribes internally, then writes a summary-only note.
-- **Summarize note**: appears on Markdown files, extracts the `## Transcript` section when present, and writes a new summary note with the source text included as transcript.
+- **Summarize note**: appears on Markdown files, extracts the `## Transcript` section when present, and writes a summary from existing text. It can create a new note or rewrite the current Markdown note while keeping the original content at the end.
 
 You can hide or show each action in settings.
 
 ## Note creation
 
-The default note title is `{{date}}`. The date can come from the recording file creation date or today's date, and the date format is configurable with tokens such as `YYYY-MM-DD` or `YYYYMMDD`.
+The default note title is `{{date}}`. The date can come from the source file creation date or today's date, and the date format is configurable with tokens such as `YYYY-MM-DD` or `YYYYMMDD`.
 
 Notes can be saved to the configured output folder or beside the source file. If enabled, the source recording is moved to the system trash after an audio note is generated successfully.
 
@@ -42,7 +42,7 @@ The default summary prompt is generated from section toggles:
 - Next steps
 - Task to do
 
-Default summaries use Markdown subheaders for each selected section. List-style content is formatted as ordered lists, and **Task to do** items are formatted as ordered Markdown checkboxes such as `1. [ ] Follow up with Alex`. **Next steps** is meant for generalized guidance, while **Task to do** is meant for specific tasks.
+Default summaries use Markdown subheaders for each selected section. List-style content is formatted as ordered lists, and **Task to do** items are formatted as Markdown checkboxes such as `- [ ] Follow up with Alex`. **Next steps** is meant for generalized guidance, while **Task to do** is meant for specific tasks.
 
 Each default summary section can be renamed in settings. The prompt settings show the plugin default prompt and the current prompt built from your toggles and section names.
 

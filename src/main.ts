@@ -43,6 +43,7 @@ interface MeetingNotesSettings {
   splitTranscriptForSummary: boolean;
   outputFolder: string;
   saveWithRecording: boolean;
+  summarizeMarkdownInPlace: boolean;
   noteTitleTemplate: string;
   titleDateFormat: string;
   titleDateSource: TitleDateSource;
@@ -111,6 +112,7 @@ interface JobState {
   summaryUsage: UsageTotals;
   summary?: string;
   error?: string;
+  originalMarkdown?: string;
 }
 
 interface AudioChunkPlan {
@@ -177,6 +179,7 @@ const DEFAULT_SETTINGS: MeetingNotesSettings = {
   splitTranscriptForSummary: false,
   outputFolder: "Meeting Notes",
   saveWithRecording: false,
+  summarizeMarkdownInPlace: false,
   noteTitleTemplate: "{{date}}",
   titleDateFormat: "YYYY-MM-DD",
   titleDateSource: "recording",
@@ -603,6 +606,21 @@ export default class MeetingNotesPlugin extends Plugin {
     }
 
     const summaryModel = normalizeSummaryModel(this.settings.summaryModel);
+    const editInPlace = this.settings.summarizeMarkdownInPlace;
+    let sourceMarkdown: string;
+    let transcript: string;
+
+    try {
+      sourceMarkdown = await this.app.vault.read(sourceFile);
+      transcript = extractSummarizableMarkdown(sourceMarkdown);
+      if (!transcript.trim()) {
+        throw new Error("Source note does not contain text to summarize.");
+      }
+    } catch (error) {
+      new Notice(`Meeting Notes failed: ${getErrorMessage(error)}`);
+      return;
+    }
+
     const title = renderTemplate(
       this.settings.noteTitleTemplate,
       sourceFile,
@@ -611,7 +629,7 @@ export default class MeetingNotesPlugin extends Plugin {
       this.settings.titleDateFormat,
       this.settings.titleDateSource
     );
-    const outputPath = await this.getAvailableOutputPath(title, sourceFile);
+    const outputPath = editInPlace ? sourceFile.path : await this.getAvailableOutputPath(title, sourceFile);
     const now = new Date().toISOString();
     const state: JobState = {
       title,
@@ -624,37 +642,33 @@ export default class MeetingNotesPlugin extends Plugin {
       summaryModel,
       diarize: false,
       includeSummary: true,
-      includeTranscript: true,
+      includeTranscript: !editInPlace,
       chunksTotal: 0,
       chunksDone: 0,
       progress: [
-        { label: "Created note", status: "done", detail: outputPath },
-        { label: "Read source note", status: "pending" },
+        { label: editInPlace ? "Prepared current note" : "Created note", status: "done", detail: outputPath },
+        { label: "Read source note", status: "done", detail: `${formatInteger(transcript.length)} characters` },
         { label: "Summarize transcript", status: "pending" },
       ],
-      transcriptChunks: [],
+      transcriptChunks: [
+        {
+          label: "Transcript",
+          markdown: transcript,
+          text: transcript,
+        },
+      ],
       transcriptionUsage: createUsageTotals(),
       summaryUsage: createUsageTotals(),
+      originalMarkdown: editInPlace ? sourceMarkdown : undefined,
     };
 
-    const outputFile = await this.app.vault.create(outputPath, renderJobNote(state));
+    const outputFile = editInPlace ? sourceFile : await this.app.vault.create(outputPath, renderJobNote(state));
+    if (editInPlace) {
+      await this.writeState(outputFile, state);
+    }
 
     try {
       new Notice("Meeting Notes: summary started.");
-      await this.updateProgress(outputFile, state, "Read source note", "running");
-      const sourceMarkdown = await this.app.vault.read(sourceFile);
-      const transcript = extractSummarizableMarkdown(sourceMarkdown);
-      if (!transcript.trim()) {
-        throw new Error("Source note does not contain text to summarize.");
-      }
-
-      state.transcriptChunks.push({
-        label: "Transcript",
-        markdown: transcript,
-        text: transcript,
-      });
-      await this.updateProgress(outputFile, state, "Read source note", "done", `${formatInteger(transcript.length)} characters`);
-
       await this.updateProgress(outputFile, state, "Summarize transcript", "running", `Using ${state.summaryModel}`);
       state.summary = await this.withProgressHeartbeat(
         outputFile,
@@ -1149,7 +1163,7 @@ class MeetingNotesSettingTab extends PluginSettingTab {
 
     addSummarySectionSetting(
       "Include Section 5",
-      "Default: Task to do. Toggle inclusion; edit the field on the right to change the Markdown header name. Items are generated as ordered Markdown checkboxes.",
+      "Default: Task to do. Toggle inclusion; edit the field on the right to change the Markdown header name. Items are generated as Markdown checkboxes.",
       this.plugin.settings.includeSectionTodo,
       (value) => {
         this.plugin.settings.includeSectionTodo = value;
@@ -1181,6 +1195,16 @@ class MeetingNotesSettingTab extends PluginSettingTab {
           this.plugin.settings.saveWithRecording = value;
           await this.plugin.saveSettings();
           this.display();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Edit Markdown source note")
+      .setDesc("Only affects Summarize note on Markdown files. When on, rewrite the current note and keep the original content at the end under Original note.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.summarizeMarkdownInPlace).onChange(async (value) => {
+          this.plugin.settings.summarizeMarkdownInPlace = value;
+          await this.plugin.saveSettings();
         });
       });
 
@@ -1226,10 +1250,10 @@ class MeetingNotesSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Date source")
-      .setDesc("Controls whether {{date}} and {{time}} use the recording file creation date or the current date.")
+      .setDesc("Controls whether {{date}} and {{time}} use the source file creation date or the current date.")
       .addDropdown((dropdown) => {
         dropdown
-          .addOption("recording", "Recording date")
+          .addOption("recording", "Source file creation date")
           .addOption("today", "Today's date")
           .setValue(this.plugin.settings.titleDateSource)
           .onChange(async (value) => {
@@ -1414,40 +1438,52 @@ class MultipartBuilder {
 }
 
 function renderJobNote(state: JobState): string {
-  const lines: string[] = [`# ${state.title}`, ""];
+  const lines: string[] = [];
+  const appendBlock = (...block: string[]) => {
+    if (lines.length > 0) {
+      lines.push("");
+    }
+    lines.push(...block);
+  };
 
   if (state.summary) {
-    lines.push("", "## Summary", "", state.summary.trim());
+    const summary = state.summary.trim();
+    if (startsWithMarkdownHeading(summary)) {
+      appendBlock(summary);
+    } else {
+      appendBlock("## Summary", "", summary);
+    }
   } else if (state.includeSummary) {
-    lines.push("", "## Summary", "", "_Summary will appear here after processing finishes._");
+    appendBlock("## Summary", "", "_Summary will appear here after processing finishes._");
   }
 
   if (state.includeTranscript || state.error) {
-    lines.push("", "## Transcript", "");
+    const transcriptLines = ["## Transcript", ""];
 
     if (state.transcriptChunks.length === 0) {
-      lines.push("_Transcript will appear here as chunks complete._");
+      transcriptLines.push("_Transcript will appear here as chunks complete._");
     } else {
       for (const chunk of state.transcriptChunks) {
         if (state.transcriptChunks.length > 1) {
-          lines.push(`### ${chunk.label}`, "");
+          transcriptLines.push(`### ${chunk.label}`, "");
         }
-        lines.push(chunk.markdown.trim(), "");
+        transcriptLines.push(chunk.markdown.trim(), "");
       }
     }
+    appendBlock(...transcriptLines);
   }
 
   if (state.error) {
-    lines.push("", "## Error", "", state.error);
+    appendBlock("## Error", "", state.error);
   }
 
-  lines.push("", "## Progress", "");
+  const progressLines = ["## Progress", ""];
   for (const item of state.progress) {
-    lines.push(`${progressPrefix(item.status)} ${item.label}${item.detail ? ` - ${item.detail}` : ""}`);
+    progressLines.push(`${progressPrefix(item.status)} ${item.label}${item.detail ? ` - ${item.detail}` : ""}`);
   }
+  appendBlock(...progressLines);
 
-  lines.push(
-    "",
+  const propertyLines = [
     "## Properties",
     "",
     `- source: ${state.sourcePath}`,
@@ -1458,13 +1494,18 @@ function renderJobNote(state: JobState): string {
     `- diarize: ${state.diarize}`,
     `- include_summary: ${state.includeSummary}`,
     `- include_transcript: ${state.includeTranscript}`,
-    `- started_at: ${state.startedAt}`,
-    `- updated_at: ${state.updatedAt}`
-  );
+    `- started_at: ${formatPropertyTimestamp(state.startedAt)}`,
+    `- updated_at: ${formatPropertyTimestamp(state.updatedAt)}`,
+  ];
   if (state.mode !== "markdown-summary") {
-    lines.push(...formatUsageProperties("transcription", state.transcriptionUsage));
+    propertyLines.push(...formatUsageProperties("transcription", state.transcriptionUsage));
   }
-  lines.push(...formatUsageProperties("summary", state.summaryUsage));
+  propertyLines.push(...formatUsageProperties("summary", state.summaryUsage));
+  appendBlock(...propertyLines);
+
+  if (state.originalMarkdown !== undefined) {
+    appendBlock("## Original note", "", state.originalMarkdown.trim() || "_Original note was empty._");
+  }
 
   return `${lines.join("\n").replace(/\s+$/u, "")}\n`;
 }
@@ -1490,9 +1531,14 @@ function markRunningItemsFailed(state: JobState) {
   }
 }
 
+function startsWithMarkdownHeading(markdown: string): boolean {
+  return /^\s*#{1,6}\s+\S/u.test(markdown);
+}
+
 function extractSummarizableMarkdown(markdown: string): string {
   const transcriptSection = extractMarkdownSection(markdown, "Transcript");
-  return (transcriptSection ?? markdown).trim();
+  const originalNoteSection = extractMarkdownSection(markdown, "Original note");
+  return (transcriptSection ?? originalNoteSection ?? markdown).trim();
 }
 
 function extractMarkdownSection(markdown: string, sectionName: string): string | null {
@@ -1575,6 +1621,14 @@ function formatDate(date: Date, format: string): string {
   return (format || DEFAULT_SETTINGS.titleDateFormat).replace(/YYYY|YY|MM|M|DD|D|HH|H|mm|m|ss|s/gu, (token) => values[token]);
 }
 
+function formatPropertyTimestamp(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return value;
+  }
+  return formatDate(date, "YYYY-MM-DD HH:mm:ss");
+}
+
 function getParentPath(path: string): string {
   const parts = path.split("/");
   parts.pop();
@@ -1639,7 +1693,7 @@ function buildGeneratedSummaryInstructions(settings: MeetingNotesSettings): stri
     "Use only the transcript content; do not invent names, dates, decisions, or tasks.",
     "Preserve important names, dates, numbers, and technical terms.",
     `Return Markdown with exactly these subheaders, in this order: ${selectedSections.map((section) => `## ${section.name}`).join(", ")}.`,
-    "Use ordered lists under each subheader. Do not use simple bullet points.",
+    "Use ordered lists under non-task subheaders. For task checkbox sections, use Markdown task checkboxes with no ordered-list numbers.",
     ...selectedSections.map(summarySectionInstruction),
   ].join("\n");
 }
@@ -1687,7 +1741,7 @@ function summarySectionInstruction(section: { key: string; name: string }): stri
   if (section.key === "nextSteps") {
     return `For ${section.name}, list generalized guidance that follows from the meeting.`;
   }
-  return `For ${section.name}, list specific actionable tasks only. Use ordered Markdown task checkboxes exactly like \`1. [ ] Task\`; include owner or deadline only if stated.`;
+  return `For ${section.name}, list specific actionable tasks only. Use Markdown task checkboxes exactly like \`- [ ] Task\`; include owner or deadline only if stated.`;
 }
 
 function sectionName(value: string, fallback: string): string {
@@ -1714,7 +1768,7 @@ function normalizeSummaryMarkdown(summary: string, settings: MeetingNotesSetting
 
       if (inTaskSection) {
         const taskText = extractListItemText(line);
-        return taskText ? `1. [ ] ${taskText}` : line;
+        return taskText ? `- [ ] ${taskText}` : line;
       }
 
       const listText = extractBulletItemText(line);
@@ -2195,10 +2249,10 @@ function formatInteger(value: number): string {
 }
 
 function formatUsd(value: number): string {
-  if (value > 0 && value < 0.000001) {
-    return "<$0.000001";
+  if (value > 0 && value < 0.001) {
+    return "<$0.001";
   }
-  return `$${value.toFixed(6)}`;
+  return `$${value.toFixed(3)}`;
 }
 
 function buildTranscriptionHeartbeatDetail(chunkIndex: number, chunksTotal: number, elapsedSeconds: number): string {
