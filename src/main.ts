@@ -11,7 +11,14 @@ import {
   normalizePath,
 } from "obsidian";
 
-type JobMode = "generate" | "transcribe" | "transcribe-diarize" | "transcribe-summary" | "transcribe-summary-diarize" | "summary";
+type JobMode =
+  | "generate"
+  | "transcribe"
+  | "transcribe-diarize"
+  | "transcribe-summary"
+  | "transcribe-summary-diarize"
+  | "summary"
+  | "markdown-summary";
 type ProgressStatus = "pending" | "running" | "done" | "error";
 type TitleDateSource = "recording" | "today";
 
@@ -48,6 +55,7 @@ interface MeetingNotesSettings {
   showTranscribeSummary: boolean;
   showTranscribeSummaryDiarize: boolean;
   showSummary: boolean;
+  showSummarizeMarkdown: boolean;
 }
 
 interface ProgressItem {
@@ -181,6 +189,7 @@ const DEFAULT_SETTINGS: MeetingNotesSettings = {
   showTranscribeSummary: true,
   showTranscribeSummaryDiarize: true,
   showSummary: true,
+  showSummarizeMarkdown: true,
 };
 
 const AUDIO_EXTENSIONS = new Set([
@@ -234,7 +243,7 @@ export default class MeetingNotesPlugin extends Plugin {
 
     this.registerEvent(
       this.app.workspace.on("file-menu", (menu, file) => {
-        this.addAudioFileMenuItems(menu, file);
+        this.addFileMenuItems(menu, file);
       })
     );
 
@@ -253,6 +262,7 @@ export default class MeetingNotesPlugin extends Plugin {
     if (this.settings.titleDateSource !== "recording" && this.settings.titleDateSource !== "today") {
       this.settings.titleDateSource = DEFAULT_SETTINGS.titleDateSource;
     }
+    this.settings.summaryModel = normalizeSummaryModel(this.settings.summaryModel);
   }
 
   async saveSettings() {
@@ -287,11 +297,29 @@ export default class MeetingNotesPlugin extends Plugin {
     return models.length;
   }
 
-  private addAudioFileMenuItems(menu: Menu, file: TAbstractFile) {
-    if (!(file instanceof TFile) || !this.isSupportedAudioFile(file)) {
+  private addFileMenuItems(menu: Menu, file: TAbstractFile) {
+    if (!(file instanceof TFile)) {
       return;
     }
 
+    if (this.isSupportedAudioFile(file)) {
+      this.addAudioFileMenuItems(menu, file);
+      return;
+    }
+
+    if (file.extension.toLowerCase() === "md" && this.settings.showSummarizeMarkdown) {
+      menu.addItem((item) => {
+        item
+          .setTitle("Summarize note")
+          .setIcon("list-checks")
+          .onClick(() => {
+            void this.startMarkdownSummaryJob(file);
+          });
+      });
+    }
+  }
+
+  private addAudioFileMenuItems(menu: Menu, file: TFile) {
     for (const action of this.getVisibleActions()) {
       menu.addItem((item) => {
         item
@@ -407,7 +435,7 @@ export default class MeetingNotesPlugin extends Plugin {
       startedAt: now,
       updatedAt: now,
       transcriptionModel,
-      summaryModel: this.settings.summaryModel.trim() || DEFAULT_SETTINGS.summaryModel,
+      summaryModel: normalizeSummaryModel(this.settings.summaryModel),
       diarize: options.diarize,
       includeSummary: options.includeSummary,
       includeTranscript: options.includeTranscript,
@@ -518,6 +546,89 @@ export default class MeetingNotesPlugin extends Plugin {
 
   private effectiveTranscriptionModel(options: Pick<JobOptions, "diarize" | "transcriptionModel">): string {
     return options.diarize ? "gpt-4o-transcribe-diarize" : options.transcriptionModel.trim() || DEFAULT_SETTINGS.transcriptionModel;
+  }
+
+  private async startMarkdownSummaryJob(sourceFile: TFile) {
+    if (!this.settings.apiKey.trim()) {
+      new Notice("Meeting Notes: add your OpenAI API key in settings first.");
+      return;
+    }
+
+    const summaryModel = normalizeSummaryModel(this.settings.summaryModel);
+    const title = renderTemplate(
+      this.settings.noteTitleTemplate,
+      sourceFile,
+      "markdown-summary",
+      summaryModel,
+      this.settings.titleDateFormat,
+      this.settings.titleDateSource
+    );
+    const outputPath = await this.getAvailableOutputPath(title, sourceFile);
+    const now = new Date().toISOString();
+    const state: JobState = {
+      title,
+      sourcePath: sourceFile.path,
+      mode: "markdown-summary",
+      status: "in_progress",
+      startedAt: now,
+      updatedAt: now,
+      transcriptionModel: "none",
+      summaryModel,
+      diarize: false,
+      includeSummary: true,
+      includeTranscript: true,
+      chunksTotal: 0,
+      chunksDone: 0,
+      progress: [
+        { label: "Created note", status: "done", detail: outputPath },
+        { label: "Read source note", status: "pending" },
+        { label: "Summarize transcript", status: "pending" },
+      ],
+      transcriptChunks: [],
+      transcriptionUsage: createUsageTotals(),
+      summaryUsage: createUsageTotals(),
+    };
+
+    const outputFile = await this.app.vault.create(outputPath, renderJobNote(state));
+
+    try {
+      new Notice("Meeting Notes: summary started.");
+      await this.updateProgress(outputFile, state, "Read source note", "running");
+      const sourceMarkdown = await this.app.vault.read(sourceFile);
+      const transcript = extractSummarizableMarkdown(sourceMarkdown);
+      if (!transcript.trim()) {
+        throw new Error("Source note does not contain text to summarize.");
+      }
+
+      state.transcriptChunks.push({
+        label: "Transcript",
+        markdown: transcript,
+        text: transcript,
+      });
+      await this.updateProgress(outputFile, state, "Read source note", "done", `${formatInteger(transcript.length)} characters`);
+
+      await this.updateProgress(outputFile, state, "Summarize transcript", "running", `Using ${state.summaryModel}`);
+      state.summary = await this.withProgressHeartbeat(
+        outputFile,
+        state,
+        "Summarize transcript",
+        (elapsedSeconds) => `Using ${state.summaryModel}; elapsed ${formatDuration(elapsedSeconds)}`,
+        () => this.summarizeTranscript(outputFile, state)
+      );
+      await this.updateProgress(outputFile, state, "Summarize transcript", "done");
+
+      state.status = "completed";
+      state.updatedAt = new Date().toISOString();
+      await this.writeState(outputFile, state);
+      new Notice("Meeting Notes: summary completed.");
+    } catch (error) {
+      state.status = "failed";
+      state.error = getErrorMessage(error);
+      state.updatedAt = new Date().toISOString();
+      markRunningItemsFailed(state);
+      await this.writeState(outputFile, state);
+      new Notice(`Meeting Notes failed: ${state.error}`);
+    }
   }
 
   private async getAvailableOutputPath(rawTitle: string, sourceFile: TFile): Promise<string> {
@@ -685,7 +796,7 @@ export default class MeetingNotesPlugin extends Plugin {
 
   private async requestSummary(transcript: string, sourceLabel: string, summaryModel: string): Promise<SummaryResult> {
     const instructions = buildSummaryInstructions(this.settings);
-    const model = summaryModel.trim() || DEFAULT_SETTINGS.summaryModel;
+    const model = normalizeSummaryModel(summaryModel);
     const response = await requestUrl({
       url: "https://api.openai.com/v1/responses",
       method: "POST",
@@ -696,7 +807,7 @@ export default class MeetingNotesPlugin extends Plugin {
       body: JSON.stringify({
         model,
         instructions,
-        input: `Source recording: ${sourceLabel}\n\nTranscript:\n${transcript}`,
+        input: `Source file: ${sourceLabel}\n\nTranscript:\n${transcript}`,
         text: {
           verbosity: "low",
         },
@@ -1014,8 +1125,8 @@ class MeetingNotesSettingTab extends PluginSettingTab {
     containerEl.createEl("h3", { text: "Note creation" });
 
     new Setting(containerEl)
-      .setName("Save note beside recording")
-      .setDesc("When on, the new note is saved in the same folder as the audio file and the output folder below is ignored.")
+      .setName("Save note beside source file")
+      .setDesc("When on, the new note is saved in the same folder as the audio or Markdown source file and the output folder below is ignored.")
       .addToggle((toggle) => {
         toggle.setValue(this.plugin.settings.saveWithRecording).onChange(async (value) => {
           this.plugin.settings.saveWithRecording = value;
@@ -1026,7 +1137,7 @@ class MeetingNotesSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Output folder")
-      .setDesc("Created if it does not exist. Ignored when Save note beside recording is on.")
+      .setDesc("Created if it does not exist. Ignored when Save note beside source file is on.")
       .addText((text) => {
         text
           .setPlaceholder("Meeting Notes")
@@ -1164,6 +1275,16 @@ class MeetingNotesSettingTab extends PluginSettingTab {
         });
       });
 
+    new Setting(containerEl)
+      .setName("Show Summarize note")
+      .setDesc("Appears on Markdown files. Uses the current summary model, summary output settings, and note creation settings.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.showSummarizeMarkdown).onChange(async (value) => {
+          this.plugin.settings.showSummarizeMarkdown = value;
+          await this.plugin.saveSettings();
+        });
+      });
+
     containerEl.createEl("h3", { text: "Prompts" });
 
     const transcriptionPromptSetting = new Setting(containerEl)
@@ -1249,7 +1370,7 @@ function renderJobNote(state: JobState): string {
   if (state.summary) {
     lines.push("", "## Summary", "", state.summary.trim());
   } else if (state.includeSummary) {
-    lines.push("", "## Summary", "", "_Summary will appear here after transcription finishes._");
+    lines.push("", "## Summary", "", "_Summary will appear here after processing finishes._");
   }
 
   if (state.includeTranscript || state.error) {
@@ -1291,7 +1412,9 @@ function renderJobNote(state: JobState): string {
     `- started_at: ${state.startedAt}`,
     `- updated_at: ${state.updatedAt}`
   );
-  lines.push(...formatUsageProperties("transcription", state.transcriptionUsage));
+  if (state.mode !== "markdown-summary") {
+    lines.push(...formatUsageProperties("transcription", state.transcriptionUsage));
+  }
   lines.push(...formatUsageProperties("summary", state.summaryUsage));
 
   return `${lines.join("\n").replace(/\s+$/u, "")}\n`;
@@ -1316,6 +1439,43 @@ function markRunningItemsFailed(state: JobState) {
       item.status = "error";
     }
   }
+}
+
+function extractSummarizableMarkdown(markdown: string): string {
+  const transcriptSection = extractMarkdownSection(markdown, "Transcript");
+  return (transcriptSection ?? markdown).trim();
+}
+
+function extractMarkdownSection(markdown: string, sectionName: string): string | null {
+  const lines = markdown.split("\n");
+  const target = sectionName.toLowerCase();
+  const sectionLines: string[] = [];
+  let sectionLevel = 0;
+  let inSection = false;
+
+  for (const line of lines) {
+    const headingMatch = line.match(/^(#{1,6})\s+(.+?)\s*$/u);
+    if (headingMatch) {
+      const level = headingMatch[1].length;
+      const heading = headingMatch[2].trim().replace(/:$/u, "").toLowerCase();
+
+      if (inSection && level <= sectionLevel) {
+        break;
+      }
+      if (!inSection && heading === target) {
+        inSection = true;
+        sectionLevel = level;
+        continue;
+      }
+    }
+
+    if (inSection) {
+      sectionLines.push(line);
+    }
+  }
+
+  const section = sectionLines.join("\n").trim();
+  return section ? section : null;
 }
 
 function renderTemplate(template: string, file: TFile, mode: JobMode, model: string, dateFormat: string, dateSource: TitleDateSource): string {
@@ -1757,9 +1917,17 @@ function readOpenAiError(body: string, fallback: string): string {
   return body || fallback;
 }
 
+function normalizeSummaryModel(model: string): string {
+  const value = model.trim();
+  if (value === "gpt-5.5-mini") {
+    return "gpt-5.4-mini";
+  }
+  return value || DEFAULT_SETTINGS.summaryModel;
+}
+
 function getSummaryModelOptions(settings: MeetingNotesSettings): string[] {
   const values = [
-    settings.summaryModel,
+    normalizeSummaryModel(settings.summaryModel),
     DEFAULT_SETTINGS.summaryModel,
     ...DEFAULT_SUMMARY_MODEL_OPTIONS,
     ...settings.availableSummaryModels,

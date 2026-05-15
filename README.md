@@ -1,6 +1,6 @@
 # Meeting Notes
 
-Meeting Notes is an Obsidian plugin for existing audio files in your vault. Right-click a supported recording and choose a transcription, summary, or preset meeting-notes action.
+Meeting Notes is an Obsidian plugin for existing audio and Markdown files in your vault. Right-click a supported recording to transcribe or summarize it, or right-click a Markdown transcript to generate meeting notes from existing text.
 
 The plugin creates the Markdown note immediately, then rewrites it with live progress as it prepares the file, calls OpenAI, finishes each chunk, and optionally creates the summary.
 
@@ -16,6 +16,7 @@ The file context menu can show any combination of these actions:
 - **Transcribe and summary**
 - **Transcribe and summary (diarize)**
 - **Summary**: transcribes internally, then writes a summary-only note.
+- **Summarize note**: appears on Markdown files, extracts the `## Transcript` section when present, and writes a new summary note with the source text included as transcript.
 
 You can hide or show each action in settings.
 
@@ -23,7 +24,7 @@ You can hide or show each action in settings.
 
 The default note title is `{{date}}`. The date can come from the recording file creation date or today's date, and the date format is configurable with tokens such as `YYYY-MM-DD` or `YYYYMMDD`.
 
-Notes can be saved to the configured output folder or beside the source recording. If enabled, the source recording is moved to the system trash after the note is generated successfully.
+Notes can be saved to the configured output folder or beside the source file. If enabled, the source recording is moved to the system trash after an audio note is generated successfully.
 
 Generated notes are ordered as summary, transcript, error if any, progress, then properties. Metadata is rendered as a Markdown section at the end rather than YAML frontmatter at the top.
 
@@ -67,7 +68,7 @@ Your OpenAI API key is stored in this plugin's Obsidian settings data for the va
 
 ## Submission notes
 
-This plugin is designed for existing files only. It does not record audio, run in the background, or watch folders. It adds commands to the file context menu for supported audio extensions.
+This plugin is designed for existing files only. It does not record audio, run in the background, or watch folders. It adds commands to the file context menu for supported audio extensions and Markdown transcript files.
 
 ## Development
 
