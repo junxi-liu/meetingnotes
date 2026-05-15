@@ -4,6 +4,8 @@ Meeting Notes is an Obsidian plugin for existing audio files in your vault. Righ
 
 The plugin creates the Markdown note immediately, then rewrites it with live progress as it prepares the file, calls OpenAI, finishes each chunk, and optionally creates the summary.
 
+Progress updates are event-based plus a configurable heartbeat while long prepare, transcription, or summary requests are running. The OpenAI transcription request itself is synchronous; the plugin is not polling a separate OpenAI status endpoint.
+
 ## Right-click actions
 
 The file context menu can show any combination of these actions:
@@ -22,6 +24,8 @@ You can hide or show each action in settings.
 The default note title is `{{date}}`. The date can come from the recording file creation date or today's date, and the date format is configurable with tokens such as `YYYY-MM-DD` or `YYYYMMDD`.
 
 Notes can be saved to the configured output folder or beside the source recording. If enabled, the source recording is moved to the system trash after the note is generated successfully.
+
+Generated notes are ordered as summary, transcript, error if any, progress, then properties. Metadata is rendered as a Markdown section at the end rather than YAML frontmatter at the top.
 
 ## Summary workflow
 
@@ -54,6 +58,8 @@ Settings let you choose:
 - Transcription model: `gpt-4o-mini-transcribe`, `gpt-4o-transcribe`, or `whisper-1`.
 - Diarization: when enabled, the plugin uses `gpt-4o-transcribe-diarize` with `response_format=diarized_json` and `chunking_strategy=auto`.
 - Summary model: any Responses API text model, defaulting to `gpt-5.5`. The summary model dropdown can be refreshed from OpenAI's `GET /v1/models` endpoint using your API key.
+
+The plugin estimates transcription time from decoded audio duration using rough model-specific heuristics. Actual time depends on audio length, file format, chunk count, diarization, server load, and audio quality.
 
 ## Privacy and API key
 

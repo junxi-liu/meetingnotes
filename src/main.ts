@@ -22,6 +22,7 @@ interface MeetingNotesSettings {
   generateSummary: boolean;
   summaryModel: string;
   availableSummaryModels: string[];
+  progressUpdateIntervalSeconds: number;
   includeSectionSummary: boolean;
   includeSectionDiscussedItems: boolean;
   includeSectionDecisions: boolean;
@@ -75,6 +76,9 @@ interface JobState {
   includeTranscript: boolean;
   chunksTotal: number;
   chunksDone: number;
+  sourceDurationSeconds?: number;
+  estimatedTranscriptionSecondsMin?: number;
+  estimatedTranscriptionSecondsMax?: number;
   progress: ProgressItem[];
   transcriptChunks: TranscriptChunk[];
   summary?: string;
@@ -125,6 +129,7 @@ const DEFAULT_SETTINGS: MeetingNotesSettings = {
   generateSummary: true,
   summaryModel: "gpt-5.5",
   availableSummaryModels: [],
+  progressUpdateIntervalSeconds: 5,
   includeSectionSummary: true,
   includeSectionDiscussedItems: true,
   includeSectionDecisions: true,
@@ -370,6 +375,7 @@ export default class MeetingNotesPlugin extends Plugin {
         { label: "Created note", status: "done", detail: outputPath },
         { label: "Read source recording", status: "pending" },
         { label: "Prepare audio", status: "pending" },
+        { label: "Estimate time", status: "pending" },
         { label: "Transcribe audio", status: "pending" },
       ],
       transcriptChunks: [],
@@ -391,8 +397,15 @@ export default class MeetingNotesPlugin extends Plugin {
       await this.updateProgress(outputFile, state, "Read source recording", "done", formatBytes(sourceData.byteLength));
 
       await this.updateProgress(outputFile, state, "Prepare audio", "running");
-      const chunkPlans = await this.prepareChunkPlans(sourceFile, sourceData, outputFile, state);
+      const chunkPlans = await this.withProgressHeartbeat(
+        outputFile,
+        state,
+        "Prepare audio",
+        (elapsedSeconds) => `Preparing audio; elapsed ${formatDuration(elapsedSeconds)}`,
+        () => this.prepareChunkPlans(sourceFile, sourceData, outputFile, state)
+      );
       await this.updateProgress(outputFile, state, "Prepare audio", "done", `${chunkPlans.length} upload${chunkPlans.length === 1 ? "" : "s"}`);
+      await this.updateProgress(outputFile, state, "Estimate time", "done", buildEstimateDetail(state));
 
       await this.updateProgress(outputFile, state, "Transcribe audio", "running", "Connecting to OpenAI");
       let priorTranscriptTail = "";
@@ -409,7 +422,13 @@ export default class MeetingNotesPlugin extends Plugin {
               }
             : await this.makeWavChunkPayload(sourceFile, sourceData, plan);
 
-        const result = await this.transcribeChunk(payload, priorTranscriptTail, state);
+        const result = await this.withProgressHeartbeat(
+          outputFile,
+          state,
+          "Transcribe audio",
+          (elapsedSeconds) => buildTranscriptionHeartbeatDetail(state, plan.index, chunkPlans.length, elapsedSeconds),
+          () => this.transcribeChunk(payload, priorTranscriptTail, state)
+        );
         state.transcriptChunks.push({
           label: chunkPlans.length === 1 ? "Transcript" : `Chunk ${plan.index}`,
           markdown: result.markdown,
@@ -424,7 +443,13 @@ export default class MeetingNotesPlugin extends Plugin {
 
       if (options.includeSummary) {
         await this.updateProgress(outputFile, state, "Summarize transcript", "running", `Using ${state.summaryModel}`);
-        state.summary = await this.summarizeTranscript(outputFile, state);
+        state.summary = await this.withProgressHeartbeat(
+          outputFile,
+          state,
+          "Summarize transcript",
+          (elapsedSeconds) => `Using ${state.summaryModel}; elapsed ${formatDuration(elapsedSeconds)}`,
+          () => this.summarizeTranscript(outputFile, state)
+        );
         await this.updateProgress(outputFile, state, "Summarize transcript", "done");
       }
 
@@ -490,6 +515,7 @@ export default class MeetingNotesPlugin extends Plugin {
     state: JobState
   ): Promise<AudioChunkPlan[]> {
     if (sourceData.byteLength <= MAX_DIRECT_UPLOAD_BYTES) {
+      await this.estimateDirectUploadDuration(sourceData, state);
       state.chunksTotal = 1;
       state.chunksDone = 0;
       await this.writeState(outputFile, state);
@@ -505,6 +531,7 @@ export default class MeetingNotesPlugin extends Plugin {
     );
 
     const audioBuffer = await decodeAudio(sourceData);
+    applyDurationEstimate(state, audioBuffer.duration);
     const chunkSeconds = Math.max(60, Math.floor(TARGET_CHUNK_UPLOAD_BYTES / CHUNK_BYTES_PER_SECOND));
     const total = Math.ceil(audioBuffer.duration / chunkSeconds);
     const plans: AudioChunkPlan[] = [];
@@ -520,6 +547,17 @@ export default class MeetingNotesPlugin extends Plugin {
     state.chunksDone = 0;
     await this.writeState(outputFile, state);
     return plans;
+  }
+
+  private async estimateDirectUploadDuration(sourceData: ArrayBuffer, state: JobState) {
+    try {
+      const audioBuffer = await decodeAudio(sourceData);
+      applyDurationEstimate(state, audioBuffer.duration);
+    } catch {
+      state.sourceDurationSeconds = undefined;
+      state.estimatedTranscriptionSecondsMin = undefined;
+      state.estimatedTranscriptionSecondsMax = undefined;
+    }
   }
 
   private async makeWavChunkPayload(sourceFile: TFile, sourceData: ArrayBuffer, plan: AudioChunkPlan): Promise<AudioChunkPayload> {
@@ -659,6 +697,43 @@ export default class MeetingNotesPlugin extends Plugin {
   private async writeState(outputFile: TFile, state: JobState) {
     state.updatedAt = new Date().toISOString();
     await this.app.vault.process(outputFile, () => renderJobNote(state));
+  }
+
+  private async withProgressHeartbeat<T>(
+    outputFile: TFile,
+    state: JobState,
+    label: string,
+    detailFactory: (elapsedSeconds: number) => string,
+    work: () => Promise<T>
+  ): Promise<T> {
+    const intervalSeconds = normalizeProgressUpdateInterval(this.settings.progressUpdateIntervalSeconds);
+    if (intervalSeconds <= 0) {
+      return await work();
+    }
+
+    const startedAt = Date.now();
+    let stopped = false;
+    let lastWrite = Promise.resolve();
+    const writeHeartbeat = () => {
+      lastWrite = lastWrite
+        .catch(() => undefined)
+        .then(async () => {
+          if (stopped) {
+            return;
+          }
+          const elapsedSeconds = Math.max(1, Math.round((Date.now() - startedAt) / 1000));
+          await this.updateProgress(outputFile, state, label, "running", detailFactory(elapsedSeconds));
+        });
+    };
+    const timer = window.setInterval(writeHeartbeat, intervalSeconds * 1000);
+
+    try {
+      return await work();
+    } finally {
+      stopped = true;
+      window.clearInterval(timer);
+      await lastWrite.catch(() => undefined);
+    }
   }
 }
 
@@ -967,6 +1042,20 @@ class MeetingNotesSettingTab extends PluginSettingTab {
         });
       });
 
+    new Setting(containerEl)
+      .setName("Progress update interval")
+      .setDesc("Seconds between note rewrites while a long prepare, transcription, or summary request is running. Set to 0 to disable heartbeat updates.")
+      .addText((text) => {
+        text.inputEl.type = "number";
+        text
+          .setPlaceholder("5")
+          .setValue(String(this.plugin.settings.progressUpdateIntervalSeconds))
+          .onChange(async (value) => {
+            this.plugin.settings.progressUpdateIntervalSeconds = normalizeProgressUpdateInterval(Number(value));
+            await this.plugin.saveSettings();
+          });
+      });
+
     containerEl.createEl("h3", { text: "Right-click menu" });
 
     new Setting(containerEl)
@@ -1109,33 +1198,7 @@ class MultipartBuilder {
 }
 
 function renderJobNote(state: JobState): string {
-  const lines: string[] = [
-    "---",
-    `source: "${yamlEscape(state.sourcePath)}"`,
-    `status: ${state.status}`,
-    `mode: ${state.mode}`,
-    `transcription_model: "${yamlEscape(state.transcriptionModel)}"`,
-    `summary_model: "${yamlEscape(state.summaryModel)}"`,
-    `diarize: ${state.diarize}`,
-    `include_summary: ${state.includeSummary}`,
-    `include_transcript: ${state.includeTranscript}`,
-    `started_at: "${state.startedAt}"`,
-    `updated_at: "${state.updatedAt}"`,
-    "---",
-    "",
-    `# ${state.title}`,
-    "",
-    "## Progress",
-    "",
-  ];
-
-  for (const item of state.progress) {
-    lines.push(`${progressPrefix(item.status)} ${item.label}${item.detail ? ` - ${item.detail}` : ""}`);
-  }
-
-  if (state.error) {
-    lines.push("", "## Error", "", state.error);
-  }
+  const lines: string[] = [`# ${state.title}`, ""];
 
   if (state.summary) {
     lines.push("", "## Summary", "", state.summary.trim());
@@ -1156,6 +1219,37 @@ function renderJobNote(state: JobState): string {
         lines.push(chunk.markdown.trim(), "");
       }
     }
+  }
+
+  if (state.error) {
+    lines.push("", "## Error", "", state.error);
+  }
+
+  lines.push("", "## Progress", "");
+  for (const item of state.progress) {
+    lines.push(`${progressPrefix(item.status)} ${item.label}${item.detail ? ` - ${item.detail}` : ""}`);
+  }
+
+  lines.push(
+    "",
+    "## Properties",
+    "",
+    `- source: ${state.sourcePath}`,
+    `- status: ${state.status}`,
+    `- mode: ${state.mode}`,
+    `- transcription_model: ${state.transcriptionModel}`,
+    `- summary_model: ${state.summaryModel}`,
+    `- diarize: ${state.diarize}`,
+    `- include_summary: ${state.includeSummary}`,
+    `- include_transcript: ${state.includeTranscript}`,
+    `- started_at: ${state.startedAt}`,
+    `- updated_at: ${state.updatedAt}`
+  );
+  if (state.sourceDurationSeconds) {
+    lines.push(`- audio_duration: ${formatDuration(state.sourceDurationSeconds)}`);
+  }
+  if (state.estimatedTranscriptionSecondsMin && state.estimatedTranscriptionSecondsMax) {
+    lines.push(`- estimated_transcription_time: ${formatDurationRange(state.estimatedTranscriptionSecondsMin, state.estimatedTranscriptionSecondsMax)}`);
   }
 
   return `${lines.join("\n").replace(/\s+$/u, "")}\n`;
@@ -1664,11 +1758,93 @@ function isLikelySummaryModel(modelId: string): boolean {
   return !blockedFragments.some((fragment) => id.includes(fragment));
 }
 
+function normalizeProgressUpdateInterval(value: number): number {
+  if (!Number.isFinite(value)) {
+    return DEFAULT_SETTINGS.progressUpdateIntervalSeconds;
+  }
+
+  return Math.max(0, Math.min(300, Math.round(value)));
+}
+
+function applyDurationEstimate(state: JobState, durationSeconds: number) {
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+    return;
+  }
+
+  const estimate = estimateTranscriptionSeconds(durationSeconds, state.transcriptionModel);
+  state.sourceDurationSeconds = durationSeconds;
+  state.estimatedTranscriptionSecondsMin = estimate.min;
+  state.estimatedTranscriptionSecondsMax = estimate.max;
+}
+
+function estimateTranscriptionSeconds(durationSeconds: number, model: string): { min: number; max: number } {
+  const modelName = model.toLowerCase();
+  let minRatio = 0.12;
+  let maxRatio = 0.4;
+
+  if (modelName.includes("diarize")) {
+    minRatio = 0.25;
+    maxRatio = 0.75;
+  } else if (modelName.includes("mini")) {
+    minRatio = 0.08;
+    maxRatio = 0.3;
+  } else if (modelName.includes("whisper")) {
+    minRatio = 0.2;
+    maxRatio = 0.65;
+  }
+
+  return {
+    min: Math.max(10, Math.round(durationSeconds * minRatio)),
+    max: Math.max(20, Math.round(durationSeconds * maxRatio)),
+  };
+}
+
+function buildEstimateDetail(state: JobState): string {
+  if (!state.sourceDurationSeconds || !state.estimatedTranscriptionSecondsMin || !state.estimatedTranscriptionSecondsMax) {
+    return "Could not estimate audio duration";
+  }
+
+  return `audio ${formatDuration(state.sourceDurationSeconds)}; transcription roughly ${formatDurationRange(
+    state.estimatedTranscriptionSecondsMin,
+    state.estimatedTranscriptionSecondsMax
+  )}`;
+}
+
+function buildTranscriptionHeartbeatDetail(state: JobState, chunkIndex: number, chunksTotal: number, elapsedSeconds: number): string {
+  const parts = [`chunk ${chunkIndex}/${chunksTotal}`, `elapsed ${formatDuration(elapsedSeconds)}`];
+  if (state.estimatedTranscriptionSecondsMin && state.estimatedTranscriptionSecondsMax) {
+    parts.push(`rough total estimate ${formatDurationRange(state.estimatedTranscriptionSecondsMin, state.estimatedTranscriptionSecondsMax)}`);
+  }
+  return parts.join("; ");
+}
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024 * 1024) {
     return `${Math.round(bytes / 1024)} KB`;
   }
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function formatDurationRange(minSeconds: number, maxSeconds: number): string {
+  if (Math.abs(maxSeconds - minSeconds) < 5) {
+    return formatDuration(maxSeconds);
+  }
+  return `${formatDuration(minSeconds)}-${formatDuration(maxSeconds)}`;
+}
+
+function formatDuration(seconds: number): string {
+  const wholeSeconds = Math.max(0, Math.round(seconds));
+  const hours = Math.floor(wholeSeconds / 3600);
+  const minutes = Math.floor((wholeSeconds % 3600) / 60);
+  const remainingSeconds = wholeSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m ${remainingSeconds}s`;
+  }
+  return `${remainingSeconds}s`;
 }
 
 function formatTimestamp(seconds: number): string {
