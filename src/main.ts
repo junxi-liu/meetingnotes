@@ -20,6 +20,11 @@ interface MeetingNotesSettings {
   diarize: boolean;
   generateSummary: boolean;
   summaryModel: string;
+  includeSectionSummary: boolean;
+  includeSectionDiscussedItems: boolean;
+  includeSectionDecisions: boolean;
+  includeSectionTodo: boolean;
+  splitTranscriptForSummary: boolean;
   outputFolder: string;
   noteTitleTemplate: string;
   transcriptionPrompt: string;
@@ -107,11 +112,15 @@ const DEFAULT_SETTINGS: MeetingNotesSettings = {
   diarize: false,
   generateSummary: true,
   summaryModel: "gpt-5.5",
+  includeSectionSummary: true,
+  includeSectionDiscussedItems: true,
+  includeSectionDecisions: true,
+  includeSectionTodo: true,
+  splitTranscriptForSummary: false,
   outputFolder: "Meeting Notes",
   noteTitleTemplate: "{{file}} transcript {{date}}",
   transcriptionPrompt: "",
-  summaryInstructions:
-    "Create concise meeting notes with: overview, decisions, action items, unresolved questions, and important details. Preserve names, dates, numbers, and terminology from the transcript.",
+  summaryInstructions: "",
   showGenerateMeetingNotes: true,
   showTranscribe: true,
   showTranscribeDiarize: true,
@@ -134,6 +143,8 @@ const MAX_DIRECT_UPLOAD_BYTES = 24 * 1024 * 1024;
 const TARGET_CHUNK_UPLOAD_BYTES = 22 * 1024 * 1024;
 const CHUNK_SAMPLE_RATE = 16000;
 const CHUNK_BYTES_PER_SECOND = CHUNK_SAMPLE_RATE * 2;
+const LEGACY_DEFAULT_SUMMARY_INSTRUCTIONS =
+  "Create concise meeting notes with: overview, decisions, action items, unresolved questions, and important details. Preserve names, dates, numbers, and terminology from the transcript.";
 
 export default class MeetingNotesPlugin extends Plugin {
   settings: MeetingNotesSettings;
@@ -151,7 +162,11 @@ export default class MeetingNotesPlugin extends Plugin {
   }
 
   async loadSettings() {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+    const loaded = (await this.loadData()) as Partial<MeetingNotesSettings> | null;
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded);
+    if (this.settings.summaryInstructions.trim() === LEGACY_DEFAULT_SUMMARY_INSTRUCTIONS) {
+      this.settings.summaryInstructions = "";
+    }
   }
 
   async saveSettings() {
@@ -468,11 +483,15 @@ export default class MeetingNotesPlugin extends Plugin {
   }
 
   private async summarizeTranscript(outputFile: TFile, state: JobState): Promise<string> {
-    const transcript = state.transcriptChunks.map((chunk) => chunk.text).join("\n\n");
-    const textChunks = splitTextForSummary(transcript);
+    const transcript = state.transcriptChunks.map((chunk) => `### ${chunk.label}\n${chunk.text}`).join("\n\n");
 
+    if (!this.settings.splitTranscriptForSummary) {
+      return await this.requestSummary(transcript, state.sourcePath, state.summaryModel);
+    }
+
+    const textChunks = splitTextForSummary(transcript);
     if (textChunks.length === 1) {
-      return await this.requestSummary(textChunks[0], state.sourcePath);
+      return await this.requestSummary(textChunks[0], state.sourcePath, state.summaryModel);
     }
 
     const partialSummaries: string[] = [];
@@ -484,15 +503,15 @@ export default class MeetingNotesPlugin extends Plugin {
         "running",
         `Summarizing transcript part ${index + 1}/${textChunks.length}`
       );
-      partialSummaries.push(await this.requestSummary(textChunks[index], `${state.sourcePath}, part ${index + 1}`));
+      partialSummaries.push(await this.requestSummary(textChunks[index], `${state.sourcePath}, part ${index + 1}`, state.summaryModel));
     }
 
     await this.updateProgress(outputFile, state, "Summarize transcript", "running", "Combining partial summaries");
-    return await this.requestSummary(partialSummaries.join("\n\n"), `${state.sourcePath}, combined partial summaries`);
+    return await this.requestSummary(partialSummaries.join("\n\n"), `${state.sourcePath}, combined partial summaries`, state.summaryModel);
   }
 
-  private async requestSummary(transcript: string, sourceLabel: string): Promise<string> {
-    const instructions = this.settings.summaryInstructions.trim() || DEFAULT_SETTINGS.summaryInstructions;
+  private async requestSummary(transcript: string, sourceLabel: string, summaryModel: string): Promise<string> {
+    const instructions = buildSummaryInstructions(this.settings);
     const response = await requestUrl({
       url: "https://api.openai.com/v1/responses",
       method: "POST",
@@ -501,7 +520,7 @@ export default class MeetingNotesPlugin extends Plugin {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: this.settings.summaryModel.trim() || DEFAULT_SETTINGS.summaryModel,
+        model: summaryModel.trim() || DEFAULT_SETTINGS.summaryModel,
         instructions,
         input: `Source recording: ${sourceLabel}\n\nTranscript:\n${transcript}`,
         text: {
@@ -615,7 +634,7 @@ class MeetingNotesSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Summary model")
-      .setDesc("Any Responses API text model.")
+      .setDesc("Used only for summary generation, separate from the transcription model.")
       .addText((text) => {
         text
           .setPlaceholder("gpt-5.5")
@@ -624,6 +643,46 @@ class MeetingNotesSettingTab extends PluginSettingTab {
             this.plugin.settings.summaryModel = value.trim();
             await this.plugin.saveSettings();
           });
+      });
+
+    containerEl.createEl("h3", { text: "Summary output" });
+
+    new Setting(containerEl).setName("Include Summary section").addToggle((toggle) => {
+      toggle.setValue(this.plugin.settings.includeSectionSummary).onChange(async (value) => {
+        this.plugin.settings.includeSectionSummary = value;
+        await this.plugin.saveSettings();
+      });
+    });
+
+    new Setting(containerEl).setName("Include Discussed items section").addToggle((toggle) => {
+      toggle.setValue(this.plugin.settings.includeSectionDiscussedItems).onChange(async (value) => {
+        this.plugin.settings.includeSectionDiscussedItems = value;
+        await this.plugin.saveSettings();
+      });
+    });
+
+    new Setting(containerEl).setName("Include Decisions section").addToggle((toggle) => {
+      toggle.setValue(this.plugin.settings.includeSectionDecisions).onChange(async (value) => {
+        this.plugin.settings.includeSectionDecisions = value;
+        await this.plugin.saveSettings();
+      });
+    });
+
+    new Setting(containerEl).setName("Include To-do section").addToggle((toggle) => {
+      toggle.setValue(this.plugin.settings.includeSectionTodo).onChange(async (value) => {
+        this.plugin.settings.includeSectionTodo = value;
+        await this.plugin.saveSettings();
+      });
+    });
+
+    new Setting(containerEl)
+      .setName("Split transcript before summary")
+      .setDesc("Advanced long-context models such as gpt-5.5 usually do not need this. Enable only when summary requests are too large or fail.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.splitTranscriptForSummary).onChange(async (value) => {
+          this.plugin.settings.splitTranscriptForSummary = value;
+          await this.plugin.saveSettings();
+        });
       });
 
     containerEl.createEl("h3", { text: "Notes" });
@@ -722,9 +781,10 @@ class MeetingNotesSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Summary instructions")
-      .setDesc("Used for transcribe-and-summarize notes.")
+      .setDesc("Optional. When filled, this prompt overrides the section choices above.")
       .addTextArea((text) => {
         text
+          .setPlaceholder("Leave blank to use the selected section toggles.")
           .setValue(this.plugin.settings.summaryInstructions)
           .onChange(async (value) => {
             this.plugin.settings.summaryInstructions = value;
@@ -897,6 +957,38 @@ function buildTranscriptionPrompt(basePrompt: string, priorTranscriptTail: strin
     promptParts.push(`Previous transcript context:\n${priorTranscriptTail.trim()}`);
   }
   return promptParts.filter(Boolean).join("\n\n");
+}
+
+function buildSummaryInstructions(settings: MeetingNotesSettings): string {
+  const customPrompt = settings.summaryInstructions.trim();
+  if (customPrompt) {
+    return customPrompt;
+  }
+
+  const sections: string[] = [];
+  if (settings.includeSectionSummary) {
+    sections.push("Summary");
+  }
+  if (settings.includeSectionDiscussedItems) {
+    sections.push("Discussed items");
+  }
+  if (settings.includeSectionDecisions) {
+    sections.push("Decisions");
+  }
+  if (settings.includeSectionTodo) {
+    sections.push("To-do");
+  }
+
+  const selectedSections = sections.length > 0 ? sections : ["Summary"];
+  return [
+    "Create concise meeting notes from the transcript.",
+    "Use only the transcript content; do not invent names, dates, decisions, or tasks.",
+    "Preserve important names, dates, numbers, and technical terms.",
+    `Return Markdown with exactly these sections, in this order: ${selectedSections.join(", ")}.`,
+    "For Discussed items, list the substantive topics covered.",
+    "For Decisions, list decisions or settled conclusions only.",
+    "For To-do, list concrete action items; include owner or deadline only if stated.",
+  ].join("\n");
 }
 
 async function decodeAudio(data: ArrayBuffer): Promise<AudioBuffer> {

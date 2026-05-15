@@ -1,6 +1,6 @@
 {
   "name": "meeting-notes",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Obsidian plugin for transcribing existing meeting recordings with OpenAI.",
   "main": "main.js",
   "type": "module",

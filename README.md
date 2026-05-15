@@ -20,6 +20,21 @@ The file context menu can show any combination of these actions:
 
 You can hide or show each action in settings.
 
+## Summary workflow
+
+Summary generation uses a separate summary model setting, independent of the transcription model. By default, the plugin sends the full transcript to the summary model in one request, which is the recommended setting for long-context models such as `gpt-5.5`.
+
+If a summary request is too large or fails, enable **Split transcript before summary**. That older workflow summarizes transcript parts first, then asks the summary model to combine the partial summaries.
+
+The default summary prompt is generated from section toggles:
+
+- Summary
+- Discussed items
+- Decisions
+- To-do
+
+If you enter custom **Summary instructions**, that prompt overrides the section toggles.
+
 ## Supported audio files
 
 The OpenAI Audio API supports `mp3`, `mp4`, `mpeg`, `mpga`, `m4a`, `wav`, and `webm`. Files below the upload limit are sent as-is. Larger files are decoded in Obsidian and split into 16 kHz mono WAV chunks before upload.
