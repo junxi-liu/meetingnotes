@@ -218,6 +218,38 @@ const DEFAULT_SUMMARY_MODEL_OPTIONS = [
   "gpt-4o",
   "gpt-4o-mini",
 ];
+const SUMMARY_MODEL_ALLOW_PATTERNS = [
+  /^gpt-5(?:\.\d+)?(?:-(?:mini|nano|pro))?$/u,
+  /^gpt-4\.1(?:-(?:mini|nano))?$/u,
+  /^gpt-4o(?:-mini)?$/u,
+  /^gpt-4(?:-turbo)?$/u,
+  /^o[134](?:-(?:mini|pro))?$/u,
+];
+const SUMMARY_MODEL_BLOCK_PATTERNS = [
+  /-\d{4}(?:-\d{2}-\d{2})?$/u,
+  /(?:^|-)audio(?:-|$)/u,
+  /(?:^|-)chat-latest$/u,
+  /(?:^|-)codex(?:-|$)/u,
+  /(?:^|-)computer-use(?:-|$)/u,
+  /(?:^|-)deep-research(?:-|$)/u,
+  /(?:^|-)instruct(?:-|$)/u,
+  /(?:^|-)preview(?:-|$)/u,
+  /(?:^|-)search(?:-|$)/u,
+  /babbage/u,
+  /dall-e/u,
+  /davinci/u,
+  /embedding/u,
+  /image/u,
+  /moderation/u,
+  /realtime/u,
+  /sora/u,
+  /speech/u,
+  /transcribe/u,
+  /tts/u,
+  /video/u,
+  /voice/u,
+  /whisper/u,
+];
 const TEXT_MODEL_PRICES_PER_1M: Record<string, TokenPrices> = {
   "gpt-5.5": { input: 5, cachedInput: 0.5, output: 30 },
   "gpt-5.4": { input: 2.5, cachedInput: 0.25, output: 15 },
@@ -1969,23 +2001,7 @@ function readModelIds(responseJson: unknown): string[] {
 
 function isLikelySummaryModel(modelId: string): boolean {
   const id = modelId.toLowerCase();
-  const blockedFragments = [
-    "audio",
-    "dall-e",
-    "embedding",
-    "image",
-    "moderation",
-    "realtime",
-    "sora",
-    "speech",
-    "transcribe",
-    "tts",
-    "video",
-    "voice",
-    "whisper",
-  ];
-
-  return !blockedFragments.some((fragment) => id.includes(fragment));
+  return SUMMARY_MODEL_ALLOW_PATTERNS.some((pattern) => pattern.test(id)) && !SUMMARY_MODEL_BLOCK_PATTERNS.some((pattern) => pattern.test(id));
 }
 
 function normalizeProgressUpdateInterval(value: number): number {
