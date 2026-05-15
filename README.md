@@ -7,6 +7,19 @@ Meeting Notes is an Obsidian plugin for existing audio files in your vault. Righ
 
 The plugin creates the Markdown note immediately, then rewrites it with live progress as it prepares the file, calls OpenAI, finishes each chunk, and optionally creates the summary.
 
+## Right-click actions
+
+The file context menu can show any combination of these actions:
+
+- **Generate meeting notes**: uses your preset model, diarization, summary, and title-template settings.
+- **Transcribe**
+- **Transcribe (diarize)**
+- **Transcribe and summary**
+- **Transcribe and summary (diarize)**
+- **Summary**: transcribes internally, then writes a summary-only note.
+
+You can hide or show each action in settings.
+
 ## Supported audio files
 
 The OpenAI Audio API supports `mp3`, `mp4`, `mpeg`, `mpga`, `m4a`, `wav`, and `webm`. Files below the upload limit are sent as-is. Larger files are decoded in Obsidian and split into 16 kHz mono WAV chunks before upload.

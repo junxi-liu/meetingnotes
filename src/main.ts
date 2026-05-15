@@ -11,18 +11,25 @@ import {
   normalizePath,
 } from "obsidian";
 
-type JobMode = "transcribe" | "summarize";
+type JobMode = "generate" | "transcribe" | "transcribe-diarize" | "transcribe-summary" | "transcribe-summary-diarize" | "summary";
 type ProgressStatus = "pending" | "running" | "done" | "error";
 
 interface MeetingNotesSettings {
   apiKey: string;
   transcriptionModel: string;
   diarize: boolean;
+  generateSummary: boolean;
   summaryModel: string;
   outputFolder: string;
   noteTitleTemplate: string;
   transcriptionPrompt: string;
   summaryInstructions: string;
+  showGenerateMeetingNotes: boolean;
+  showTranscribe: boolean;
+  showTranscribeDiarize: boolean;
+  showTranscribeSummary: boolean;
+  showTranscribeSummaryDiarize: boolean;
+  showSummary: boolean;
 }
 
 interface ProgressItem {
@@ -47,6 +54,8 @@ interface JobState {
   transcriptionModel: string;
   summaryModel: string;
   diarize: boolean;
+  includeSummary: boolean;
+  includeTranscript: boolean;
   chunksTotal: number;
   chunksDone: number;
   progress: ProgressItem[];
@@ -81,16 +90,34 @@ interface TranscriptionResult {
   text: string;
 }
 
+interface JobOptions {
+  mode: JobMode;
+  title: string;
+  icon: string;
+  diarize: boolean;
+  includeSummary: boolean;
+  includeTranscript: boolean;
+  transcriptionModel: string;
+  titleTemplate: string;
+}
+
 const DEFAULT_SETTINGS: MeetingNotesSettings = {
   apiKey: "",
   transcriptionModel: "gpt-4o-mini-transcribe",
   diarize: false,
+  generateSummary: true,
   summaryModel: "gpt-5.5",
   outputFolder: "Meeting Notes",
   noteTitleTemplate: "{{file}} transcript {{date}}",
   transcriptionPrompt: "",
   summaryInstructions:
     "Create concise meeting notes with: overview, decisions, action items, unresolved questions, and important details. Preserve names, dates, numbers, and terminology from the transcript.",
+  showGenerateMeetingNotes: true,
+  showTranscribe: true,
+  showTranscribeDiarize: true,
+  showTranscribeSummary: true,
+  showTranscribeSummaryDiarize: true,
+  showSummary: true,
 };
 
 const AUDIO_EXTENSIONS = new Set([
@@ -136,48 +163,118 @@ export default class MeetingNotesPlugin extends Plugin {
       return;
     }
 
-    menu.addItem((item) => {
-      item
-        .setTitle("Transcribe to note")
-        .setIcon("mic")
-        .onClick(() => {
-          void this.startJob(file, "transcribe");
-        });
-    });
-
-    menu.addItem((item) => {
-      item
-        .setTitle("Transcribe and summarize to note")
-        .setIcon("file-text")
-        .onClick(() => {
-          void this.startJob(file, "summarize");
-        });
-    });
+    for (const action of this.getVisibleActions()) {
+      menu.addItem((item) => {
+        item
+          .setTitle(action.title)
+          .setIcon(action.icon)
+          .onClick(() => {
+            void this.startJob(file, action);
+          });
+      });
+    }
   }
 
   private isSupportedAudioFile(file: TFile): boolean {
     return AUDIO_EXTENSIONS.has(file.extension.toLowerCase());
   }
 
-  private async startJob(sourceFile: TFile, mode: JobMode) {
+  private getVisibleActions(): JobOptions[] {
+    const actions: JobOptions[] = [
+      {
+        mode: "generate",
+        title: "Generate meeting notes",
+        icon: "file-text",
+        diarize: this.settings.diarize,
+        includeSummary: this.settings.generateSummary,
+        includeTranscript: true,
+        transcriptionModel: this.settings.transcriptionModel.trim(),
+        titleTemplate: this.settings.noteTitleTemplate,
+      },
+      {
+        mode: "transcribe",
+        title: "Transcribe",
+        icon: "mic",
+        diarize: false,
+        includeSummary: false,
+        includeTranscript: true,
+        transcriptionModel: this.settings.transcriptionModel.trim(),
+        titleTemplate: this.settings.noteTitleTemplate,
+      },
+      {
+        mode: "transcribe-diarize",
+        title: "Transcribe (diarize)",
+        icon: "mic",
+        diarize: true,
+        includeSummary: false,
+        includeTranscript: true,
+        transcriptionModel: this.settings.transcriptionModel.trim(),
+        titleTemplate: this.settings.noteTitleTemplate,
+      },
+      {
+        mode: "transcribe-summary",
+        title: "Transcribe and summary",
+        icon: "file-text",
+        diarize: false,
+        includeSummary: true,
+        includeTranscript: true,
+        transcriptionModel: this.settings.transcriptionModel.trim(),
+        titleTemplate: this.settings.noteTitleTemplate,
+      },
+      {
+        mode: "transcribe-summary-diarize",
+        title: "Transcribe and summary (diarize)",
+        icon: "file-text",
+        diarize: true,
+        includeSummary: true,
+        includeTranscript: true,
+        transcriptionModel: this.settings.transcriptionModel.trim(),
+        titleTemplate: this.settings.noteTitleTemplate,
+      },
+      {
+        mode: "summary",
+        title: "Summary",
+        icon: "list-checks",
+        diarize: this.settings.diarize,
+        includeSummary: true,
+        includeTranscript: false,
+        transcriptionModel: this.settings.transcriptionModel.trim(),
+        titleTemplate: this.settings.noteTitleTemplate,
+      },
+    ];
+
+    return actions.filter((action) => {
+      if (action.mode === "generate") return this.settings.showGenerateMeetingNotes;
+      if (action.mode === "transcribe") return this.settings.showTranscribe;
+      if (action.mode === "transcribe-diarize") return this.settings.showTranscribeDiarize;
+      if (action.mode === "transcribe-summary") return this.settings.showTranscribeSummary;
+      if (action.mode === "transcribe-summary-diarize") return this.settings.showTranscribeSummaryDiarize;
+      return this.settings.showSummary;
+    });
+  }
+
+  private async startJob(sourceFile: TFile, options: JobOptions) {
     if (!this.settings.apiKey.trim()) {
       new Notice("Meeting Notes: add your OpenAI API key in settings first.");
       return;
     }
 
-    const title = renderTemplate(this.settings.noteTitleTemplate, sourceFile, mode, this.effectiveTranscriptionModel());
+    const transcriptionModel = this.effectiveTranscriptionModel(options);
+    const title = renderTemplate(options.titleTemplate, sourceFile, options.mode, transcriptionModel);
     const outputPath = await this.getAvailableOutputPath(title);
     const now = new Date().toISOString();
     const state: JobState = {
       title,
       sourcePath: sourceFile.path,
-      mode,
+      mode: options.mode,
       status: "in_progress",
       startedAt: now,
       updatedAt: now,
-      transcriptionModel: this.effectiveTranscriptionModel(),
+      transcriptionModel,
       summaryModel: this.settings.summaryModel.trim(),
-      diarize: this.settings.diarize,
+      diarize: options.diarize,
+      includeSummary: options.includeSummary,
+      includeTranscript: options.includeTranscript,
       chunksTotal: 0,
       chunksDone: 0,
       progress: [
@@ -189,7 +286,7 @@ export default class MeetingNotesPlugin extends Plugin {
       transcriptChunks: [],
     };
 
-    if (mode === "summarize") {
+    if (options.includeSummary) {
       state.progress.push({ label: "Summarize transcript", status: "pending" });
     }
 
@@ -220,7 +317,7 @@ export default class MeetingNotesPlugin extends Plugin {
               }
             : await this.makeWavChunkPayload(sourceFile, sourceData, plan);
 
-        const result = await this.transcribeChunk(payload, priorTranscriptTail);
+        const result = await this.transcribeChunk(payload, priorTranscriptTail, state);
         state.transcriptChunks.push({
           label: chunkPlans.length === 1 ? "Transcript" : `Chunk ${plan.index}`,
           markdown: result.markdown,
@@ -233,7 +330,7 @@ export default class MeetingNotesPlugin extends Plugin {
 
       await this.updateProgress(outputFile, state, "Transcribe audio", "done", `${state.chunksDone}/${state.chunksTotal} chunks finished`);
 
-      if (mode === "summarize") {
+      if (options.includeSummary) {
         await this.updateProgress(outputFile, state, "Summarize transcript", "running", `Using ${state.summaryModel}`);
         state.summary = await this.summarizeTranscript(outputFile, state);
         await this.updateProgress(outputFile, state, "Summarize transcript", "done");
@@ -255,8 +352,8 @@ export default class MeetingNotesPlugin extends Plugin {
     }
   }
 
-  private effectiveTranscriptionModel(): string {
-    return this.settings.diarize ? "gpt-4o-transcribe-diarize" : this.settings.transcriptionModel.trim();
+  private effectiveTranscriptionModel(options: Pick<JobOptions, "diarize" | "transcriptionModel">): string {
+    return options.diarize ? "gpt-4o-transcribe-diarize" : options.transcriptionModel.trim() || DEFAULT_SETTINGS.transcriptionModel;
   }
 
   private async getAvailableOutputPath(rawTitle: string): Promise<string> {
@@ -333,14 +430,13 @@ export default class MeetingNotesPlugin extends Plugin {
     };
   }
 
-  private async transcribeChunk(payload: AudioChunkPayload, priorTranscriptTail: string): Promise<TranscriptionResult> {
+  private async transcribeChunk(payload: AudioChunkPayload, priorTranscriptTail: string, state: JobState): Promise<TranscriptionResult> {
     const boundary = `meeting-notes-${Date.now()}-${Math.random().toString(16).slice(2)}`;
     const form = new MultipartBuilder(boundary);
-    const model = this.effectiveTranscriptionModel();
 
-    form.appendField("model", model);
+    form.appendField("model", state.transcriptionModel);
 
-    if (this.settings.diarize) {
+    if (state.diarize) {
       form.appendField("response_format", "diarized_json");
       form.appendField("chunking_strategy", "auto");
     } else {
@@ -368,7 +464,7 @@ export default class MeetingNotesPlugin extends Plugin {
       throw new Error(readOpenAiError(response.text, `OpenAI transcription request failed with HTTP ${response.status}`));
     }
 
-    return formatTranscriptionResponse(response.json, this.settings.diarize, payload.offsetSeconds);
+    return formatTranscriptionResponse(response.json, state.diarize, payload.offsetSeconds);
   }
 
   private async summarizeTranscript(outputFile: TFile, state: JobState): Promise<string> {
@@ -466,6 +562,8 @@ class MeetingNotesSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
+    containerEl.createEl("h3", { text: "OpenAI" });
+
     new Setting(containerEl)
       .setName("OpenAI API key")
       .setDesc("Stored in this vault's plugin data.")
@@ -482,7 +580,7 @@ class MeetingNotesSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Transcription model")
-      .setDesc("Used when diarization is off.")
+      .setDesc("Used by Generate meeting notes and non-diarized actions.")
       .addDropdown((dropdown) => {
         dropdown
           .addOption("gpt-4o-mini-transcribe", "gpt-4o-mini-transcribe")
@@ -497,10 +595,20 @@ class MeetingNotesSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Diarize speakers")
-      .setDesc("Uses gpt-4o-transcribe-diarize and speaker-aware JSON output.")
+      .setDesc("Default for Generate meeting notes and Summary. Explicit diarized actions always diarize.")
       .addToggle((toggle) => {
         toggle.setValue(this.plugin.settings.diarize).onChange(async (value) => {
           this.plugin.settings.diarize = value;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName("Generate meeting notes includes summary")
+      .setDesc("When off, Generate meeting notes only transcribes.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.generateSummary).onChange(async (value) => {
+          this.plugin.settings.generateSummary = value;
           await this.plugin.saveSettings();
         });
       });
@@ -517,6 +625,8 @@ class MeetingNotesSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       });
+
+    containerEl.createEl("h3", { text: "Notes" });
 
     new Setting(containerEl)
       .setName("Output folder")
@@ -543,6 +653,58 @@ class MeetingNotesSettingTab extends PluginSettingTab {
             await this.plugin.saveSettings();
           });
       });
+
+    containerEl.createEl("h3", { text: "Right-click menu" });
+
+    new Setting(containerEl)
+      .setName("Show Generate meeting notes")
+      .setDesc("Uses the preset transcription model, diarization, summary, and title settings above.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.showGenerateMeetingNotes).onChange(async (value) => {
+          this.plugin.settings.showGenerateMeetingNotes = value;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    new Setting(containerEl).setName("Show Transcribe").addToggle((toggle) => {
+      toggle.setValue(this.plugin.settings.showTranscribe).onChange(async (value) => {
+        this.plugin.settings.showTranscribe = value;
+        await this.plugin.saveSettings();
+      });
+    });
+
+    new Setting(containerEl).setName("Show Transcribe (diarize)").addToggle((toggle) => {
+      toggle.setValue(this.plugin.settings.showTranscribeDiarize).onChange(async (value) => {
+        this.plugin.settings.showTranscribeDiarize = value;
+        await this.plugin.saveSettings();
+      });
+    });
+
+    new Setting(containerEl).setName("Show Transcribe and summary").addToggle((toggle) => {
+      toggle.setValue(this.plugin.settings.showTranscribeSummary).onChange(async (value) => {
+        this.plugin.settings.showTranscribeSummary = value;
+        await this.plugin.saveSettings();
+      });
+    });
+
+    new Setting(containerEl).setName("Show Transcribe and summary (diarize)").addToggle((toggle) => {
+      toggle.setValue(this.plugin.settings.showTranscribeSummaryDiarize).onChange(async (value) => {
+        this.plugin.settings.showTranscribeSummaryDiarize = value;
+        await this.plugin.saveSettings();
+      });
+    });
+
+    new Setting(containerEl)
+      .setName("Show Summary")
+      .setDesc("Transcribes internally, writes a summary-only note, and uses the default diarization setting.")
+      .addToggle((toggle) => {
+        toggle.setValue(this.plugin.settings.showSummary).onChange(async (value) => {
+          this.plugin.settings.showSummary = value;
+          await this.plugin.saveSettings();
+        });
+      });
+
+    containerEl.createEl("h3", { text: "Prompts" });
 
     new Setting(containerEl)
       .setName("Transcription prompt")
@@ -623,6 +785,8 @@ function renderJobNote(state: JobState): string {
     `transcription_model: "${yamlEscape(state.transcriptionModel)}"`,
     `summary_model: "${yamlEscape(state.summaryModel)}"`,
     `diarize: ${state.diarize}`,
+    `include_summary: ${state.includeSummary}`,
+    `include_transcript: ${state.includeTranscript}`,
     `started_at: "${state.startedAt}"`,
     `updated_at: "${state.updatedAt}"`,
     "---",
@@ -643,20 +807,22 @@ function renderJobNote(state: JobState): string {
 
   if (state.summary) {
     lines.push("", "## Summary", "", state.summary.trim());
-  } else if (state.mode === "summarize") {
+  } else if (state.includeSummary) {
     lines.push("", "## Summary", "", "_Summary will appear here after transcription finishes._");
   }
 
-  lines.push("", "## Transcript", "");
+  if (state.includeTranscript || state.error) {
+    lines.push("", "## Transcript", "");
 
-  if (state.transcriptChunks.length === 0) {
-    lines.push("_Transcript will appear here as chunks complete._");
-  } else {
-    for (const chunk of state.transcriptChunks) {
-      if (state.transcriptChunks.length > 1) {
-        lines.push(`### ${chunk.label}`, "");
+    if (state.transcriptChunks.length === 0) {
+      lines.push("_Transcript will appear here as chunks complete._");
+    } else {
+      for (const chunk of state.transcriptChunks) {
+        if (state.transcriptChunks.length > 1) {
+          lines.push(`### ${chunk.label}`, "");
+        }
+        lines.push(chunk.markdown.trim(), "");
       }
-      lines.push(chunk.markdown.trim(), "");
     }
   }
 
