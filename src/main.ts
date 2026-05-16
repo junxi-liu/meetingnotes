@@ -1085,7 +1085,9 @@ class MeetingNotesSettingTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName("Diarize speakers")
-      .setDesc("Default for Generate meeting notes and Summary. Explicit diarized right-click actions always diarize.")
+      .setDesc(
+        "Default for Generate meeting notes and Summary. Explicit diarized right-click actions always diarize. If a recording is larger than 25 MB and must be split into chunks, speaker labels may reset across chunks."
+      )
       .addToggle((toggle) => {
         toggle.setValue(this.plugin.settings.diarize).onChange(async (value) => {
           this.plugin.settings.diarize = value;
