@@ -30,6 +30,8 @@ interface MeetingNotesSettings {
   summaryModel: string;
   availableSummaryModels: string[];
   progressUpdateIntervalSeconds: number;
+  chunkUploadSizeMb: number;
+  chunkOverlapSeconds: number;
   includeSectionSummary: boolean;
   includeSectionDiscussedItems: boolean;
   includeSectionDecisions: boolean;
@@ -69,6 +71,9 @@ interface TranscriptChunk {
   label: string;
   markdown: string;
   text: string;
+  index?: number;
+  startSeconds?: number;
+  endSeconds?: number;
 }
 
 interface UsageTotals {
@@ -166,6 +171,8 @@ const DEFAULT_SETTINGS: MeetingNotesSettings = {
   summaryModel: "gpt-5.5",
   availableSummaryModels: [],
   progressUpdateIntervalSeconds: 5,
+  chunkUploadSizeMb: 24,
+  chunkOverlapSeconds: 0,
   includeSectionSummary: true,
   includeSectionDiscussedItems: true,
   includeSectionDecisions: true,
@@ -205,8 +212,12 @@ const AUDIO_EXTENSIONS = new Set([
   "webm",
 ]);
 
-const MAX_DIRECT_UPLOAD_BYTES = 24 * 1024 * 1024;
-const TARGET_CHUNK_UPLOAD_BYTES = 22 * 1024 * 1024;
+const BYTES_PER_MB = 1_000_000;
+const MIN_CHUNK_UPLOAD_SIZE_MB = 1;
+const MAX_CHUNK_UPLOAD_SIZE_MB = 24;
+const MIN_CHUNK_OVERLAP_SECONDS = 0;
+const MAX_CHUNK_OVERLAP_SECONDS = 300;
+const CHUNK_UPLOAD_HEADROOM_BYTES = 64 * 1024;
 const CHUNK_SAMPLE_RATE = 16000;
 const CHUNK_BYTES_PER_SECOND = CHUNK_SAMPLE_RATE * 2;
 const LEGACY_DEFAULT_TITLE_TEMPLATE = "{{file}} transcript {{date}}";
@@ -297,6 +308,16 @@ export default class MeetingNotesPlugin extends Plugin {
     }
     if (this.settings.titleDateSource !== "recording" && this.settings.titleDateSource !== "today") {
       this.settings.titleDateSource = DEFAULT_SETTINGS.titleDateSource;
+    }
+    const normalizedChunkUploadSizeMb = normalizeChunkUploadSizeMb(this.settings.chunkUploadSizeMb);
+    if (this.settings.chunkUploadSizeMb !== normalizedChunkUploadSizeMb) {
+      this.settings.chunkUploadSizeMb = normalizedChunkUploadSizeMb;
+      shouldSave = true;
+    }
+    const normalizedChunkOverlapSeconds = normalizeChunkOverlapSeconds(this.settings.chunkOverlapSeconds);
+    if (this.settings.chunkOverlapSeconds !== normalizedChunkOverlapSeconds) {
+      this.settings.chunkOverlapSeconds = normalizedChunkOverlapSeconds;
+      shouldSave = true;
     }
     const normalizedSummaryModel = normalizeSummaryModel(this.settings.summaryModel);
     if (this.settings.summaryModel !== normalizedSummaryModel) {
@@ -518,6 +539,7 @@ export default class MeetingNotesPlugin extends Plugin {
       const sourceData = await this.app.vault.readBinary(sourceFile);
       await this.updateProgress(outputFile, state, "Read source recording", "done", formatBytes(sourceData.byteLength));
 
+      const chunkUploadBytes = getChunkUploadBytes(this.settings);
       await this.updateProgress(outputFile, state, "Prepare audio", "running");
       const chunkPlans = await this.withProgressHeartbeat(
         outputFile,
@@ -534,7 +556,7 @@ export default class MeetingNotesPlugin extends Plugin {
       for (const plan of chunkPlans) {
         await this.setChunkProgress(outputFile, state, plan.index - 1, chunkPlans.length, "running");
         const payload =
-          chunkPlans.length === 1 && sourceData.byteLength <= MAX_DIRECT_UPLOAD_BYTES
+          chunkPlans.length === 1 && sourceData.byteLength <= chunkUploadBytes
             ? {
                 fileName: sourceFile.name,
                 mimeType: inferMimeType(sourceFile.extension),
@@ -552,9 +574,12 @@ export default class MeetingNotesPlugin extends Plugin {
         );
         addUsageTotals(state.transcriptionUsage, result.usage);
         state.transcriptChunks.push({
-          label: chunkPlans.length === 1 ? "Transcript" : `Chunk ${plan.index}`,
+          label: formatTranscriptChunkLabel(plan, chunkPlans.length),
           markdown: result.markdown,
           text: result.text,
+          index: plan.index,
+          startSeconds: plan.startSeconds,
+          endSeconds: plan.endSeconds,
         });
         priorTranscriptTail = result.text.slice(-1600);
         state.chunksDone = plan.index;
@@ -655,6 +680,7 @@ export default class MeetingNotesPlugin extends Plugin {
           label: "Transcript",
           markdown: transcript,
           text: transcript,
+          index: 1,
         },
       ],
       transcriptionUsage: createUsageTotals(),
@@ -730,7 +756,8 @@ export default class MeetingNotesPlugin extends Plugin {
     outputFile: TFile,
     state: JobState
   ): Promise<AudioChunkPlan[]> {
-    if (sourceData.byteLength <= MAX_DIRECT_UPLOAD_BYTES) {
+    const chunkUploadBytes = getChunkUploadBytes(this.settings);
+    if (sourceData.byteLength <= chunkUploadBytes) {
       state.chunksTotal = 1;
       state.chunksDone = 0;
       await this.writeState(outputFile, state);
@@ -742,18 +769,31 @@ export default class MeetingNotesPlugin extends Plugin {
       state,
       "Prepare audio",
       "running",
-      "File exceeds the OpenAI upload limit; decoding for local chunking"
+      `File exceeds the configured ${this.settings.chunkUploadSizeMb} MB upload chunk size; decoding for local chunking`
     );
 
     const audioBuffer = await decodeAudio(sourceData);
-    const chunkSeconds = Math.max(60, Math.floor(TARGET_CHUNK_UPLOAD_BYTES / CHUNK_BYTES_PER_SECOND));
-    const total = Math.ceil(audioBuffer.duration / chunkSeconds);
+    const chunkSeconds = Math.max(1, Math.floor((chunkUploadBytes - CHUNK_UPLOAD_HEADROOM_BYTES) / CHUNK_BYTES_PER_SECOND));
+    const overlapSeconds = Math.min(this.settings.chunkOverlapSeconds, Math.max(0, chunkSeconds - 1));
+    const stepSeconds = Math.max(1, chunkSeconds - overlapSeconds);
     const plans: AudioChunkPlan[] = [];
+    let startSeconds = 0;
 
-    for (let index = 1; index <= total; index += 1) {
-      const startSeconds = (index - 1) * chunkSeconds;
-      const endSeconds = Math.min(index * chunkSeconds, audioBuffer.duration);
-      plans.push({ index, total, startSeconds, endSeconds });
+    while (startSeconds < audioBuffer.duration) {
+      const endSeconds = Math.min(startSeconds + chunkSeconds, audioBuffer.duration);
+      plans.push({ index: plans.length + 1, total: 0, startSeconds, endSeconds });
+      if (endSeconds >= audioBuffer.duration) {
+        break;
+      }
+      startSeconds += stepSeconds;
+    }
+    if (plans.length === 0) {
+      plans.push({ index: 1, total: 1, startSeconds: 0, endSeconds: 0 });
+    }
+
+    const total = plans.length;
+    for (const plan of plans) {
+      plan.total = total;
     }
 
     decodedAudioCache.set(sourceFile.path, audioBuffer);
@@ -821,7 +861,7 @@ export default class MeetingNotesPlugin extends Plugin {
   }
 
   private async summarizeTranscript(outputFile: TFile, state: JobState): Promise<string> {
-    const transcript = state.transcriptChunks.map((chunk) => `### ${chunk.label}\n${chunk.text}`).join("\n\n");
+    const transcript = getOrderedTranscriptChunks(state.transcriptChunks).map((chunk) => `### ${chunk.label}\n${chunk.text}`).join("\n\n");
 
     if (!this.settings.splitTranscriptForSummary) {
       const result = await this.requestSummary(transcript, state.sourcePath, state.summaryModel);
@@ -1093,6 +1133,38 @@ class MeetingNotesSettingTab extends PluginSettingTab {
           this.plugin.settings.diarize = value;
           await this.plugin.saveSettings();
         });
+      });
+
+    new Setting(containerEl)
+      .setName("Audio chunk size")
+      .setDesc("Maximum upload size per local audio chunk, in MB. Default is 24 MB to stay below OpenAI's 25 MB file upload limit.")
+      .addText((text) => {
+        text.inputEl.type = "number";
+        text
+          .setPlaceholder("24")
+          .setValue(String(this.plugin.settings.chunkUploadSizeMb))
+          .onChange(async (value) => {
+            this.plugin.settings.chunkUploadSizeMb = normalizeChunkUploadSizeMb(
+              value.trim() ? Number(value) : DEFAULT_SETTINGS.chunkUploadSizeMb
+            );
+            await this.plugin.saveSettings();
+          });
+      });
+
+    new Setting(containerEl)
+      .setName("Chunk overlap")
+      .setDesc("Seconds of audio to repeat at the start of each chunk after the first. Default is 0. Overlap can preserve boundary context but may duplicate transcript text.")
+      .addText((text) => {
+        text.inputEl.type = "number";
+        text
+          .setPlaceholder("0")
+          .setValue(String(this.plugin.settings.chunkOverlapSeconds))
+          .onChange(async (value) => {
+            this.plugin.settings.chunkOverlapSeconds = normalizeChunkOverlapSeconds(
+              value.trim() ? Number(value) : DEFAULT_SETTINGS.chunkOverlapSeconds
+            );
+            await this.plugin.saveSettings();
+          });
       });
 
     new Setting(containerEl)
@@ -1439,6 +1511,24 @@ class MultipartBuilder {
   }
 }
 
+function getOrderedTranscriptChunks(chunks: TranscriptChunk[]): TranscriptChunk[] {
+  return [...chunks].sort((left, right) => {
+    const leftIndex = left.index ?? Number.MAX_SAFE_INTEGER;
+    const rightIndex = right.index ?? Number.MAX_SAFE_INTEGER;
+    if (leftIndex !== rightIndex) {
+      return leftIndex - rightIndex;
+    }
+    return (left.startSeconds ?? 0) - (right.startSeconds ?? 0);
+  });
+}
+
+function formatTranscriptChunkLabel(plan: AudioChunkPlan, chunksTotal: number): string {
+  if (chunksTotal === 1) {
+    return "Transcript";
+  }
+  return `Chunk ${plan.index} (${formatChunkBoundary(plan.startSeconds)} to ${formatChunkBoundary(plan.endSeconds)})`;
+}
+
 function renderJobNote(state: JobState): string {
   const lines: string[] = [];
   const appendBlock = (...block: string[]) => {
@@ -1461,12 +1551,13 @@ function renderJobNote(state: JobState): string {
 
   if (state.includeTranscript || state.error) {
     const transcriptLines = ["## Transcript", ""];
+    const transcriptChunks = getOrderedTranscriptChunks(state.transcriptChunks);
 
-    if (state.transcriptChunks.length === 0) {
+    if (transcriptChunks.length === 0) {
       transcriptLines.push("_Transcript will appear here as chunks complete._");
     } else {
-      for (const chunk of state.transcriptChunks) {
-        if (state.transcriptChunks.length > 1) {
+      for (const chunk of transcriptChunks) {
+        if (transcriptChunks.length > 1) {
           transcriptLines.push(`### ${chunk.label}`, "");
         }
         transcriptLines.push(chunk.markdown.trim(), "");
@@ -2068,6 +2159,26 @@ function normalizeProgressUpdateInterval(value: number): number {
   return Math.max(0, Math.min(300, Math.round(value)));
 }
 
+function normalizeChunkUploadSizeMb(value: number): number {
+  if (!Number.isFinite(value)) {
+    return DEFAULT_SETTINGS.chunkUploadSizeMb;
+  }
+
+  return Math.max(MIN_CHUNK_UPLOAD_SIZE_MB, Math.min(MAX_CHUNK_UPLOAD_SIZE_MB, Math.round(value)));
+}
+
+function normalizeChunkOverlapSeconds(value: number): number {
+  if (!Number.isFinite(value)) {
+    return DEFAULT_SETTINGS.chunkOverlapSeconds;
+  }
+
+  return Math.max(MIN_CHUNK_OVERLAP_SECONDS, Math.min(MAX_CHUNK_OVERLAP_SECONDS, Math.round(value)));
+}
+
+function getChunkUploadBytes(settings: MeetingNotesSettings): number {
+  return normalizeChunkUploadSizeMb(settings.chunkUploadSizeMb) * BYTES_PER_MB;
+}
+
 function createUsageTotals(): UsageTotals {
   return {
     inputTokens: 0,
@@ -2281,6 +2392,18 @@ function formatDuration(seconds: number): string {
     return `${minutes}m ${remainingSeconds}s`;
   }
   return `${remainingSeconds}s`;
+}
+
+function formatChunkBoundary(seconds: number): string {
+  const wholeSeconds = Math.max(0, Math.round(seconds));
+  const hours = Math.floor(wholeSeconds / 3600);
+  const minutes = Math.floor((wholeSeconds % 3600) / 60);
+  const remainingSeconds = wholeSeconds % 60;
+
+  if (hours > 0) {
+    return `${hours}h ${pad2(minutes)}m ${pad2(remainingSeconds)}s`;
+  }
+  return `${minutes}m ${pad2(remainingSeconds)}s`;
 }
 
 function formatTimestamp(seconds: number): string {

@@ -50,14 +50,18 @@ If you enter a custom **Summary prompt**, that prompt overrides the section togg
 
 ## Supported audio files
 
-The OpenAI Audio API supports `mp3`, `mp4`, `mpeg`, `mpga`, `m4a`, `wav`, and `webm`. Files below the upload limit are sent as-is. Larger files are decoded in Obsidian and split into 16 kHz mono WAV chunks before upload.
+The OpenAI Audio API supports `mp3`, `mp4`, `mpeg`, `mpga`, `m4a`, `wav`, and `webm`. Files below the configured chunk size are sent as-is. Larger files are decoded in Obsidian and split into 16 kHz mono WAV chunks before upload.
+
+The default chunk size is 24 MB to stay below OpenAI's 25 MB file upload limit. You can lower the chunk size in settings, and you can add a chunk overlap in seconds so each chunk after the first repeats a short amount of audio from the previous chunk. Overlap can preserve boundary context but may duplicate transcript text.
+
+When a recording is chunked, transcript sections are rendered in chunk order with time ranges, such as `Chunk 2 (12m 25s to 24m 52s)`.
 
 ## OpenAI models
 
 Settings let you choose:
 
 - Transcription model: `gpt-4o-mini-transcribe`, `gpt-4o-transcribe`, or `whisper-1`.
-- Diarization: when enabled, the plugin uses `gpt-4o-transcribe-diarize` with `response_format=diarized_json` and `chunking_strategy=auto`.
+- Diarization: when enabled, the plugin uses `gpt-4o-transcribe-diarize` with `response_format=diarized_json` and `chunking_strategy=auto`. If a file is large enough to require local chunking, speaker labels may reset across chunks.
 - Summary model: a general text or reasoning model for the Responses API, defaulting to `gpt-5.5`. The summary model dropdown can be refreshed from OpenAI's `GET /v1/models` endpoint using your API key, and filters out special-purpose models such as transcription, computer-use, search, image, embedding, Codex, and dated snapshot models.
 
 Generated notes include transcription and summary usage in the final Properties section. Cost is estimated from usage returned by OpenAI and the plugin's built-in price table for known models; unknown model pricing is shown as unavailable.
